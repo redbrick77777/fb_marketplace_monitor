@@ -1,0 +1,73 @@
+# Copy this file to config.yaml and fill in your own values:
+#   cp config.example.yaml config.yaml
+#
+# Secrets can also be supplied via environment variables instead of putting
+# them in this file: SOCIAVAULT_API_KEY, GOOGLE_SERVICE_ACCOUNT_FILE
+# (env vars take priority over the values below, if both are set).
+
+sociavault_api_key: "sk_live_your_key_here"
+
+# Only needed if at least one watch below uses output_type: google_sheets.
+# Leave it out entirely if everything writes to local xlsx files.
+# google_service_account_file: "service_account.json"
+
+# Where the dedupe/location-cache database lives. Created automatically.
+db_path: "data/seen_listings.db"
+
+# Optional: also write logs to this file (in addition to stdout).
+log_file: "logs/monitor.log"
+
+# One or more searches ("watches"). Each is tracked independently for
+# dedupe purposes, and can write to its own file/sheet+tab - this is what
+# makes the app reusable for future projects, not just this one.
+watches:
+  - name: tires_285_70_18_jax          # must be unique across all watches
+    city: "Jacksonville, FL"
+    radius_miles: 50
+    keywords:                          # what must appear in the title to count as a match
+      - "285 70 18"
+      - "285/70/18"
+      - "285/70R18"
+      - "LT285/70R18"
+    search_terms:                      # what's actually SENT to SociaVault's search.
+      - "285 70 18 tires"              # Facebook's own search relevance is poor on bare
+      - "LT285/70R18 tires"            # numbers alone - include a plain category word
+                                        # like "tires" or you may get zero/few results
+                                        # even though the listings clearly exist. If you
+                                        # omit search_terms entirely, it falls back to
+                                        # using `keywords` as-is (not recommended for
+                                        # number-only variants like these).
+    check_description: false           # true = also check the listing description if the
+                                        # title alone doesn't match (costs 1 extra SociaVault
+                                        # credit per non-matching listing - see README)
+    exclude_keywords:                  # skip listings whose title matches any of these
+      - "rims only"
+      - "wheel only"
+    price_min: 0
+    price_max: 400
+    condition_filter: "used"           # omit this line entirely to skip the condition check
+    max_pages: 5                       # search result pages to pull per keyword, per run
+
+    # --- Output: pick ONE of the two blocks below ---
+
+    # Option A (default, zero setup): write to a local .xlsx file.
+    output_type: xlsx
+    output_file: "output/marketplace_finds.xlsx"
+    sheet_tab: "Tires"                 # worksheet name inside that file
+
+    # Option B: write to a Google Sheet instead (needs the service account
+    # setup described in the README). Comment out the two lines above and
+    # uncomment these three:
+    # output_type: google_sheets
+    # sheet_id: "your_google_sheet_id_here"
+    # sheet_tab: "Tires"
+
+  # Add more searches for other projects here, e.g.:
+  # - name: standing_desks_austin
+  #   city: "Austin, TX"
+  #   radius_miles: 25
+  #   keywords: ["standing desk", "sit stand desk"]
+  #   price_max: 300
+  #   output_type: xlsx
+  #   output_file: "output/desks.xlsx"
+  #   sheet_tab: "Desks"
