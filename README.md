@@ -221,6 +221,35 @@ gets its own dedupe tracking and can write to a different xlsx file (or
 sheet/tab). That's the intended way to reuse this for other projects instead
 of the tire search alone.
 
+## Known SociaVault quirks (learned the hard way)
+
+Their documentation contradicts itself in several places, and the live API
+doesn't always match either version. Consolidated here so the pattern is
+recognizable if something *new* breaks the same way, rather than needing to
+be rediscovered from scratch:
+
+- **Search endpoint wants `lat`/`lng`, not `latitude`/`longitude`** - their
+  own blog tutorials use the latter; their actual API reference (and the
+  live error message, `"lat is required and must be a number"`) confirm the
+  former. `sociavault_client.py`'s `search()` uses the correct names.
+- **The real search payload is double-wrapped**: `{"success": true, "data":
+  {"success": true, "listings": {...}}}` - not a flat `{"listings": [...]}`
+  as the docs examples show. `search()` unwraps `data.data` if present.
+- **`listings` (and `locations`, from location-search) come back as an
+  object keyed by string index** (`"0"`, `"1"`, ...), not a JSON array.
+  Both `search()` and `resolve_location()` normalize this to a real list.
+- **A failure can hide inside an HTTP 200** - `{"success": false, "error":
+  "..."}` with a 200 status, not just via 4xx/5xx. `_get()` checks the
+  `success` field explicitly and raises `SociaVaultError` if it's `False`,
+  rather than trusting the status code alone.
+
+If a future response shape looks "off" (e.g. a field is unexpectedly empty,
+or nested differently than expected), the fix pattern that's worked every
+time so far: get the **raw** response via `curl` directly (bypassing our
+client entirely) and diff it against what the code assumes - don't guess
+from behavior alone, since this vendor's actual API and its docs disagree
+often enough that assumptions from docs alone haven't been reliable.
+
 ## Files
 
 ```
