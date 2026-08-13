@@ -10,5 +10,6 @@ config.yaml
 
 data/*.db
 data/*.xlsx
+output/
 
 .claude/

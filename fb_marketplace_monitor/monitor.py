@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .config import AppConfig, WatchConfig
+from .geo import haversine_miles
 from .matching import matches_any_keyword, matches_exclusions, to_broad_query
 from .sheets_client import SheetsClient
 from .sociavault_client import SociaVaultClient, SociaVaultError
@@ -98,6 +99,7 @@ def run_watch(
     keyword_mismatch_count = 0
     excluded_count = 0
     price_filtered_count = 0
+    location_filtered_count = 0
     condition_filtered_count = 0
 
     for listing_id, listing in candidates.items():
@@ -150,6 +152,29 @@ def run_watch(
             store.mark_seen(watch.name, listing_id)  # checked once, decided - never re-check
             continue
 
+        # radius_miles is sent to SociaVault's search too, but Facebook itself
+        # doesn't honor it strictly - scrolling far enough surfaces listings
+        # well outside the requested radius, the same way it surfaces
+        # keyword-irrelevant ones (hence matches_any_keyword above). The
+        # search response's own `location` field is city-level only (no
+        # coordinates); the real per-listing pin only comes from item detail,
+        # so this necessarily costs a credit even for watches that don't need
+        # description/condition. Listings with no coordinates at all (e.g.
+        # ship-only listings with no fixed pickup point) are dropped too,
+        # same as an item-detail fetch failure - neither can be confirmed
+        # in-range, and treating them as in-range is exactly the bug we're
+        # fixing.
+        item_location = _extract_location(get_item_detail())
+        if item_location is None:
+            location_filtered_count += 1
+            store.mark_seen(watch.name, listing_id)
+            continue
+        distance_miles = haversine_miles(latitude, longitude, item_location[0], item_location[1])
+        if distance_miles > watch.radius_miles:
+            location_filtered_count += 1
+            store.mark_seen(watch.name, listing_id)
+            continue
+
         # Only spend an extra credit on item detail if the watch actually
         # needs condition info - the search endpoint alone doesn't include it.
         if watch.condition_filter:
@@ -165,6 +190,7 @@ def run_watch(
                 listing_id,
                 title,
                 formatted_price,
+                f"{distance_miles:.1f}",
                 listing_link(listing_id),
                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 watch.name,
@@ -175,10 +201,10 @@ def run_watch(
     logger.debug(
         "Watch '%s': %d raw -> %d unique candidates -> already_seen=%d, "
         "keyword_mismatch=%d, excluded_keyword=%d, price_filtered=%d, "
-        "condition_filtered=%d, new=%d",
+        "location_filtered=%d, condition_filtered=%d, new=%d",
         watch.name, total_raw, len(candidates), already_seen_count,
         keyword_mismatch_count, excluded_count, price_filtered_count,
-        condition_filtered_count, len(new_rows),
+        location_filtered_count, condition_filtered_count, len(new_rows),
     )
 
     if not new_rows:
@@ -233,6 +259,16 @@ def _extract_description(item: Optional[dict]) -> str:
     if not item:
         return ""
     return item.get("description") or ""
+
+
+def _extract_location(item: Optional[dict]) -> Optional[tuple[float, float]]:
+    if not item:
+        return None
+    location = item.get("location") or {}
+    lat, lng = location.get("latitude"), location.get("longitude")
+    if lat is None or lng is None:
+        return None
+    return lat, lng
 
 
 def _extract_condition(item: Optional[dict]) -> Optional[str]:

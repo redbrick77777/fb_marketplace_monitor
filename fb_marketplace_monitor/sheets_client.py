@@ -18,7 +18,7 @@ from gspread.exceptions import WorksheetNotFound
 
 logger = logging.getLogger(__name__)
 
-HEADER_ROW = ["Listing ID", "Title", "Price", "Link", "Date Found", "Watch"]
+HEADER_ROW = ["Listing ID", "Title", "Price", "Distance (mi)", "Link", "Date Found", "Watch"]
 
 
 class SheetsClient:

@@ -199,6 +199,20 @@ fetched once per listing and reused for both checks, not fetched twice.
 endpoint, not search. Leave it out of a watch to skip that check and save
 credits.
 
+**Radius re-check.** `radius_miles` is sent to SociaVault's search too, but
+Facebook doesn't strictly honor it - scrolling far enough surfaces listings
+well outside the requested radius, the same way it surfaces
+keyword-irrelevant ones. The search response's own per-listing `location`
+field is city-level only (no coordinates), so precise distance can only be
+computed from the item-detail endpoint's `location.latitude`/`longitude` (the
+seller's actual pin) - this check runs for every candidate that reaches it,
+costing one extra credit unless `check_description`/`condition_filter`
+already fetched that same item detail. Listings with no coordinates at all
+(ship-only listings with no fixed pickup point) are dropped too, since
+there's no way to confirm they're in range. Matching listings get a
+`Distance (mi)` column in the output showing how far the actual pin was from
+the watch's resolved center.
+
 ### Diagnosing "found nothing"
 
 Run with `--verbose` and check the log for two specific lines:
@@ -212,7 +226,8 @@ Run with `--verbose` and check the log for two specific lines:
 
 Either way, a `DEBUG`-level summary line breaks down exactly how many
 listings were filtered out at each stage (already-seen, keyword mismatch,
-excluded, price, condition) so you're never guessing which filter did it.
+excluded, price, location, condition) so you're never guessing which filter
+did it.
 
 ## Adding more searches later
 
@@ -256,6 +271,7 @@ often enough that assumptions from docs alone haven't been reliable.
 fb_marketplace_monitor/
   config.py            # loads/validates config.yaml
   matching.py           # keyword normalization + matching
+  geo.py                 # great-circle distance for the radius re-check
   sociavault_client.py  # SociaVault API wrapper (retries, pagination)
   xlsx_writer.py         # local .xlsx output backend (default, no setup)
   sheets_client.py        # Google Sheets output backend (service account auth)
