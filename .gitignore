@@ -6,10 +6,13 @@ venv/
 .DS_Store
 
 config.yaml
+config.yaml.save
 .env
+service_account.json
 
-data/*.db
+data/*.db*
 data/*.xlsx
 output/
+logs/
 
 .claude/
