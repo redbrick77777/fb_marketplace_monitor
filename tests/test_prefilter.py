@@ -131,6 +131,11 @@ WATCH = WatchConfig(
 def test_prefilter(workdir: Path) -> None:
     store = Store(str(workdir / "prefilter.db"))
     store.cache_location(WATCH.city, *JAX)  # watch origin, already cached
+    # These two stand for cities a previous run already learned from real
+    # seller pins - the pre-filter never geocodes a city itself, so a city is
+    # only usable here if an item fetch taught us its coordinates earlier.
+    store.cache_location("Orlando, Florida", *CITY_COORDS["Orlando, Florida"])
+    store.cache_location("Jacksonville, Florida", *JAX)
     client = StubClient(LISTINGS)
 
     new_rows = run_watch(client, None, XlsxWriter(), store, WATCH, dry_run=True)
@@ -141,8 +146,8 @@ def test_prefilter(workdir: Path) -> None:
         "orlando1" not in client.get_item_calls and "orlando2" not in client.get_item_calls,
     )
     check(
-        "two listings in one city cost only one geocode (cache works)",
-        client.resolve_calls.count("Orlando, Florida") == 1,
+        "the pre-filter NEVER geocodes - a wrong answer would reject a real listing",
+        client.resolve_calls == [],
     )
     # Two survivors: Neptune Beach, plus the ambiguous "Saint Johns" that fails
     # open past the coarse filter and then passes the precise pin check.
@@ -152,20 +157,24 @@ def test_prefilter(workdir: Path) -> None:
         "far_pin" in client.get_item_calls,
     )
 
-    print("\nAmbiguous location handling:")
+    print("\nAmbiguous / unknown location handling:")
     check(
-        "city with no state is never geocoded (could match the wrong state)",
-        "Saint Johns" not in client.resolve_calls,
-    )
-    check(
-        "...and fails OPEN to the pin check rather than being dropped blind",
+        "a city with no state is not usable and fails OPEN to the pin check",
         "no_state" in client.get_item_calls,
     )
-
-    print("\nOpportunistic cache fill:")
     check(
-        "a city seen in item detail is cached without a geocode call",
-        store.get_cached_location("Jacksonville, Florida") is not None,
+        "an unlearned city also fails OPEN rather than being dropped blind",
+        "in_range" in client.get_item_calls,
+    )
+
+    print("\nCache fill from real pins (the only source):")
+    check(
+        "a city we had never seen is learned from the item's real pin",
+        store.get_cached_location("Neptune Beach, Florida") is not None,
+    )
+    check(
+        "...and learned from the pin itself, not from a geocode lookup",
+        store.get_cached_location("Neptune Beach, Florida") == ITEM_PINS["in_range"],
     )
 
 

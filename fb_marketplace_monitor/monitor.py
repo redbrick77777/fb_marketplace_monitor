@@ -56,34 +56,31 @@ def _listing_city(listing: dict) -> Optional[str]:
     return display if "," in display else None
 
 
-def resolve_city(
-    client: SociaVaultClient, store: Store, city: str
-) -> Optional[tuple[float, float]]:
-    """City name -> coordinates, via the persistent cache, geocoding on a miss.
+def lookup_city(store: Store, city: str) -> Optional[tuple[float, float]]:
+    """City name -> coordinates, from the local cache ONLY. Never geocodes.
 
-    Worth a credit in a way item detail never is: cities are a small, bounded
-    set that repeats across every future run (one full watchflip sweep touched
-    39 distinct cities), whereas listing IDs are unbounded and single-use. A
-    credit spent geocoding "Orlando, Florida" once rejects every Orlando
-    listing for free from then on; a credit spent on item detail is never
-    reusable.
+    Deliberately does not call `resolve_location()`. That endpoint returns
+    confidently wrong answers often enough to be unusable as a rejection
+    input: on 2026-08-15 it placed "Orange Park, FL" - a Jacksonville suburb
+    ~13 mi out - at 139.8 mi, "Westminster, CA" in Ontario, Canada, and
+    "Columbus, GA" in Ohio. 3 wrong out of 15.
 
-    Returns None on any failure so callers fail OPEN - this is an optimization,
-    not a correctness filter, and the seller-pin check downstream is what
-    actually decides. Never let a geocoding hiccup drop a real listing.
+    A wrong answer here is worse than no answer, because the pre-filter uses it
+    to *reject*: Orange Park listings were dropped and marked seen (a one-way
+    door) without ever having their real pin checked. Three defences that all
+    fail against this:
+      - failing open on errors - a confident wrong answer isn't an error;
+      - a state bounding-box check - Orange Park's bad coordinates are inside
+        Florida, so it passes;
+      - self-healing from real pins - a wrongly-rejected city never gets an
+        item fetch, so it never gets a pin to heal from.
+
+    So the cache is populated only from real seller pins in item detail (see
+    run_watch), which come from Facebook itself and have been accurate. It
+    warms more slowly - a city is only learned once we've paid for one item
+    fetch there - but it can never invent a reason to drop a nearby listing.
     """
-    cached = store.get_cached_location(city)
-    if cached:
-        return cached
-    try:
-        location = client.resolve_location(city)
-        lat, lng = location["latitude"], location["longitude"]
-    except (SociaVaultError, KeyError, TypeError) as exc:
-        logger.debug("Couldn't geocode city '%s' (failing open): %s", city, exc)
-        return None
-    store.cache_location(city, lat, lng)
-    logger.info("Geocoded '%s' -> (%.4f, %.4f) [cached for future runs]", city, lat, lng)
-    return lat, lng
+    return store.get_cached_location(city)
 
 
 def run_watch(
@@ -200,11 +197,11 @@ def run_watch(
         # already tells us the city for free. Rejecting on the city centroid
         # is rough (it's a city, not a yard-precise pin), so this only ever
         # rejects; anything that survives still gets the exact seller-pin
-        # check further down. Listings with no usable city fall through and
-        # get decided by that precise check instead.
+        # check further down. Listings with no usable city, or a city we've
+        # never seen a real pin for, fall through to that precise check.
         city = _listing_city(listing)
         if city:
-            city_coords = resolve_city(client, store, city)
+            city_coords = lookup_city(store, city)
             if city_coords is not None:
                 city_distance = haversine_miles(
                     latitude, longitude, city_coords[0], city_coords[1]
@@ -270,11 +267,12 @@ def run_watch(
             store.mark_seen(watch.name, listing_id)
             continue
 
-        # Free cache fill: we've already paid for this item's detail and it
-        # carries a real pin, so record the city now rather than spending a
-        # location-search credit on it later. One seller's pin stands in for
-        # the city centroid, which is plenty for the coarse pre-filter above -
-        # and this also covers cities resolve_city() couldn't geocode at all.
+        # The ONLY way location_cache gets populated for listing cities (see
+        # lookup_city for why geocoding is not trusted here). We've already
+        # paid for this item's detail and it carries a real pin from Facebook,
+        # so record the city at no extra cost. One seller's pin stands in for
+        # the city centroid, which is plenty for the coarse pre-filter above,
+        # and unlike a geocoder it cannot place a nearby suburb 140 mi away.
         if city and store.get_cached_location(city) is None:
             store.cache_location(city, item_location[0], item_location[1])
 
