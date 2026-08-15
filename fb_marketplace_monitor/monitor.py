@@ -321,12 +321,17 @@ def run_watch(
         ("condition_filtered", condition_filtered_count),
     ]
     considered = len(candidates) - already_seen_count
+    rejected_summary = ", ".join(f"{name}={count}" for name, count in reject_stages if count)
 
-    logger.debug(
-        "Watch '%s': %d raw -> %d unique candidates -> already_seen=%d, %s, new=%d",
-        watch.name, total_raw, len(candidates), already_seen_count,
-        ", ".join(f"{name}={count}" for name, count in reject_stages),
+    # INFO, not DEBUG: cron never passes --verbose, so at DEBUG this breakdown
+    # was invisible in exactly the situation it exists for. Without it the only
+    # signal a normal run gives is "no new listings", which is what made the
+    # get_item() outage indistinguishable from a quiet market for two days.
+    logger.info(
+        "Watch '%s': %d raw -> %d unique -> %d already seen -> %d considered -> %d new%s",
+        watch.name, total_raw, len(candidates), already_seen_count, considered,
         len(new_rows),
+        f" | rejected: {rejected_summary}" if rejected_summary else "",
     )
 
     if not new_rows:
@@ -334,12 +339,18 @@ def run_watch(
         all_lost_to_one_stage = considered > 0 and dominant_count == considered
 
         if all_lost_to_one_stage and dominant_stage == "keyword_mismatch":
+            # Report `considered`, NOT total_raw. The condition above is about
+            # newly-considered listings, but this used to quote the raw search
+            # total - which includes everything already skipped as seen. On
+            # 2026-08-15 that read "ALL 172 failed the keyword match" when the
+            # real number was 4, pointing at keyword tuning that wasn't needed.
             logger.warning(
-                "Watch '%s': got %d raw listing(s) from SociaVault, but ALL of "
-                "them failed the keyword match against %s. Run with --verbose "
-                "to see sample titles and check whether your keyword variants "
-                "are too strict for how sellers actually word titles.",
-                watch.name, total_raw, watch.keywords,
+                "Watch '%s': %d newly-considered listing(s) (%d more skipped as "
+                "already seen), and ALL of them failed the keyword match against "
+                "%s. Run with --verbose to see sample titles and check whether "
+                "your keyword variants are too strict for how sellers actually "
+                "word titles.",
+                watch.name, considered, already_seen_count, watch.keywords,
             )
         elif all_lost_to_one_stage:
             # The canary that was missing on 2026-08-13: when a single stage
@@ -353,9 +364,7 @@ def run_watch(
                 "them were rejected at a single stage: '%s'. One stage "
                 "rejecting 100%% of candidates usually means a systemic "
                 "failure rather than a genuinely quiet market. Full breakdown: %s",
-
-                watch.name, considered, dominant_stage,
-                ", ".join(f"{name}={count}" for name, count in reject_stages if count),
+                watch.name, considered, dominant_stage, rejected_summary,
             )
         logger.info("Watch '%s': no new listings", watch.name)
         return 0
