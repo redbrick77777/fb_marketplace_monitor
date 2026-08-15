@@ -257,6 +257,27 @@ be rediscovered from scratch:
   "..."}` with a 200 status, not just via 4xx/5xx. `_get()` checks the
   `success` field explicitly and raises `SociaVaultError` if it's `False`,
   rather than trusting the status code alone.
+- **The item-detail endpoint has the same double-wrap as search, but
+  `get_item()` didn't handle it** until 2026-08-15 - it returned the raw
+  `{"success", "data": {...}, "credits_used"}` envelope unchanged, so every
+  caller reading `description`/`location`/`attributes` off it was reading
+  the wrong (outer) object and silently got nothing. This was invisible for
+  a long time because the callers that existed then failed *open* on
+  missing data (no description match -> still keeps the listing if the
+  title matched; no condition -> condition_filter treats `None` as "don't
+  filter"). It only became visible once the radius re-check was added,
+  which fails *closed* on missing location (no coordinates -> drop) -  that
+  combination made it look like the radius filter was dropping everything,
+  when the real bug was `get_item()` itself. Fixed by unwrapping `data` the
+  same way `search()`/`resolve_location()` already do. If a future
+  item-detail field looks mysteriously always-empty, check this first.
+- **Per-listing location precision differs by endpoint**: `search()`'s
+  `location` field is city-level only (`city`/`state`/`display_name`/
+  `city_page_id`, no coordinates) - not enough for real distance math. Only
+  the item-detail endpoint's `location.latitude`/`longitude` gives the
+  seller's actual pin, which is what the radius re-check (see above) relies
+  on. Ship-only listings with no fixed pickup point return `location: {}` on
+  both endpoints - no coordinates available for those at all.
 
 If a future response shape looks "off" (e.g. a field is unexpectedly empty,
 or nested differently than expected), the fix pattern that's worked every
