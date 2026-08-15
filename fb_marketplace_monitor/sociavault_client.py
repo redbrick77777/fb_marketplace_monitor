@@ -161,4 +161,10 @@ class SociaVaultClient:
         return listings
 
     def get_item(self, item_id: str) -> dict:
-        return self._get("item", {"id": item_id})
+        raw = self._get("item", {"id": item_id})
+        # Same double-wrap quirk as search()/resolve_location() - the real
+        # fields (description, location, attributes, ...) are nested under
+        # "data", not top-level. Confirmed against a live response where
+        # get_item() was returning the wrapper itself, silently hiding
+        # location/description/attributes from every caller.
+        return raw.get("data") if isinstance(raw.get("data"), dict) else raw
