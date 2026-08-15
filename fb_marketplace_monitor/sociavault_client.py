@@ -20,6 +20,19 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.sociavault.com/v1/scrape/facebook-marketplace"
 
+# Pause between paginated search requests. SociaVault scrapes Facebook rather
+# than using an official API, so pacing requests like a real browsing session
+# is the conservative default.
+#
+# Do NOT expect this to fix the empty-page behaviour documented in
+# search_all_pages(). That was tested directly on 2026-08-15: raising the delay
+# from 0.5s to 2.0s did not eliminate mid-sequence empty pages, it only moved
+# which pages came back empty (identical queries, different results run to
+# run). Pagination is non-deterministic upstream; the cursor check is what
+# keeps results correct, not this delay. 1s is simply a politer default than
+# the original 0.5s - there is no evidence any particular value helps.
+PAGE_DELAY_SECONDS = 1.0
+
 
 class SociaVaultError(Exception):
     """Raised for any unrecoverable SociaVault API failure."""
@@ -154,9 +167,15 @@ class SociaVaultClient:
             )
             listings.extend(data.get("listings", []))
             cursor = data.get("cursor")
+            # Stop only when the cursor runs out - NEVER when a page comes back
+            # empty. An empty page does not mean the end of results, and this
+            # is not a rare edge case: two live probes on 2026-08-15 both hit
+            # it, e.g. "Breitling" returned 6 listings on page 1, ZERO on page
+            # 2, then 24 more on page 3. Breaking on an empty page would have
+            # silently dropped those 24.
             if not cursor:
                 break
-            time.sleep(0.5)
+            time.sleep(PAGE_DELAY_SECONDS)
 
         return listings
 

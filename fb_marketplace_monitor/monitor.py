@@ -33,6 +33,59 @@ def resolve_watch_location(
     return lat, lng
 
 
+def _listing_city(listing: dict) -> Optional[str]:
+    """A geocodable "City, State" string from the SEARCH response - free.
+
+    The search endpoint's per-listing `location` is city-level only, with no
+    coordinates at all (confirmed by live probe 2026-08-15: 0 of 89 listings
+    carried lat/lng), so this is good enough for a coarse pre-filter and never
+    for the authoritative distance check.
+
+    Returns None when the state is missing, which makes callers fail open. A
+    bare "Saint Johns" (seen in that same probe) could geocode to Michigan
+    instead of Florida, and a wrong geocode here would reject an in-range
+    listing without ever checking its real pin.
+    """
+    location = listing.get("location") or {}
+    city, state = location.get("city"), location.get("state")
+    if city and state:
+        return f"{city}, {state}"
+    # Fall back to display_name only when it actually carries a state -
+    # the field comes back both ways ("Jacksonville, Florida" vs "Saint Johns").
+    display = (location.get("display_name") or "").strip()
+    return display if "," in display else None
+
+
+def resolve_city(
+    client: SociaVaultClient, store: Store, city: str
+) -> Optional[tuple[float, float]]:
+    """City name -> coordinates, via the persistent cache, geocoding on a miss.
+
+    Worth a credit in a way item detail never is: cities are a small, bounded
+    set that repeats across every future run (one full watchflip sweep touched
+    39 distinct cities), whereas listing IDs are unbounded and single-use. A
+    credit spent geocoding "Orlando, Florida" once rejects every Orlando
+    listing for free from then on; a credit spent on item detail is never
+    reusable.
+
+    Returns None on any failure so callers fail OPEN - this is an optimization,
+    not a correctness filter, and the seller-pin check downstream is what
+    actually decides. Never let a geocoding hiccup drop a real listing.
+    """
+    cached = store.get_cached_location(city)
+    if cached:
+        return cached
+    try:
+        location = client.resolve_location(city)
+        lat, lng = location["latitude"], location["longitude"]
+    except (SociaVaultError, KeyError, TypeError) as exc:
+        logger.debug("Couldn't geocode city '%s' (failing open): %s", city, exc)
+        return None
+    store.cache_location(city, lat, lng)
+    logger.info("Geocoded '%s' -> (%.4f, %.4f) [cached for future runs]", city, lat, lng)
+    return lat, lng
+
+
 def run_watch(
     client: SociaVaultClient,
     sheets: Optional[SheetsClient],
@@ -99,7 +152,15 @@ def run_watch(
     keyword_mismatch_count = 0
     excluded_count = 0
     price_filtered_count = 0
-    location_filtered_count = 0
+    # Location rejections are split across four counters on purpose. They used
+    # to share one bucket, which is precisely why the get_item() envelope bug
+    # stayed invisible for two days: "fetch failed" and "listing has no pickup
+    # point" are wildly different problems, and lumping them together made a
+    # total systemic failure look exactly like a quiet market.
+    city_filtered_count = 0
+    item_fetch_failed_count = 0
+    no_coords_count = 0
+    out_of_range_count = 0
     condition_filtered_count = 0
 
     for listing_id, listing in candidates.items():
@@ -124,8 +185,39 @@ def run_watch(
             return item_detail
 
         title_matches = matches_any_keyword(title, watch.keywords)
+
+        # Cheapest rejection first: if the title doesn't match and this watch
+        # never consults the description, nothing below can rescue this
+        # listing - drop it without spending a geocode or an item credit.
+        if not title_matches and not watch.check_description:
+            keyword_mismatch_count += 1
+            store.mark_seen(watch.name, listing_id)  # checked once, decided - never re-check
+            continue
+
+        # Coarse city-level radius pre-filter, deliberately placed BEFORE the
+        # first item-detail fetch below - that's the whole point, since item
+        # detail is the expensive per-listing call and the search response
+        # already tells us the city for free. Rejecting on the city centroid
+        # is rough (it's a city, not a yard-precise pin), so this only ever
+        # rejects; anything that survives still gets the exact seller-pin
+        # check further down. Listings with no usable city fall through and
+        # get decided by that precise check instead.
+        city = _listing_city(listing)
+        if city:
+            city_coords = resolve_city(client, store, city)
+            if city_coords is not None:
+                city_distance = haversine_miles(
+                    latitude, longitude, city_coords[0], city_coords[1]
+                )
+                if city_distance > watch.radius_miles:
+                    city_filtered_count += 1
+                    store.mark_seen(watch.name, listing_id)
+                    continue
+
         description_matches = False
-        if not title_matches and watch.check_description:
+        if not title_matches:
+            # check_description is necessarily True here - the cheap early
+            # return above already dropped the alternative.
             description = _extract_description(get_item_detail())
             description_matches = matches_any_keyword(description, watch.keywords)
 
@@ -164,14 +256,31 @@ def run_watch(
         # same as an item-detail fetch failure - neither can be confirmed
         # in-range, and treating them as in-range is exactly the bug we're
         # fixing.
-        item_location = _extract_location(get_item_detail())
-        if item_location is None:
-            location_filtered_count += 1
+        item_detail_for_location = get_item_detail()
+        if item_detail_for_location is None:
+            # The fetch itself failed - a transport/API problem, NOT a fact
+            # about this listing. Counted separately from "no coordinates"
+            # because a spike here means something is broken upstream.
+            item_fetch_failed_count += 1
             store.mark_seen(watch.name, listing_id)
             continue
+        item_location = _extract_location(item_detail_for_location)
+        if item_location is None:
+            no_coords_count += 1
+            store.mark_seen(watch.name, listing_id)
+            continue
+
+        # Free cache fill: we've already paid for this item's detail and it
+        # carries a real pin, so record the city now rather than spending a
+        # location-search credit on it later. One seller's pin stands in for
+        # the city centroid, which is plenty for the coarse pre-filter above -
+        # and this also covers cities resolve_city() couldn't geocode at all.
+        if city and store.get_cached_location(city) is None:
+            store.cache_location(city, item_location[0], item_location[1])
+
         distance_miles = haversine_miles(latitude, longitude, item_location[0], item_location[1])
         if distance_miles > watch.radius_miles:
-            location_filtered_count += 1
+            out_of_range_count += 1
             store.mark_seen(watch.name, listing_id)
             continue
 
@@ -198,23 +307,55 @@ def run_watch(
         )
         pending_seen_ids.append(listing_id)
 
+    # Every way a candidate can be rejected, in pipeline order. Keep this in
+    # sync with the counters above - it drives both the summary line and the
+    # all-dropped alarm below.
+    reject_stages = [
+        ("keyword_mismatch", keyword_mismatch_count),
+        ("excluded_keyword", excluded_count),
+        ("price_filtered", price_filtered_count),
+        ("city_prefilter_out_of_radius", city_filtered_count),
+        ("item_fetch_FAILED", item_fetch_failed_count),
+        ("no_coordinates", no_coords_count),
+        ("out_of_radius_seller_pin", out_of_range_count),
+        ("condition_filtered", condition_filtered_count),
+    ]
+    considered = len(candidates) - already_seen_count
+
     logger.debug(
-        "Watch '%s': %d raw -> %d unique candidates -> already_seen=%d, "
-        "keyword_mismatch=%d, excluded_keyword=%d, price_filtered=%d, "
-        "location_filtered=%d, condition_filtered=%d, new=%d",
+        "Watch '%s': %d raw -> %d unique candidates -> already_seen=%d, %s, new=%d",
         watch.name, total_raw, len(candidates), already_seen_count,
-        keyword_mismatch_count, excluded_count, price_filtered_count,
-        location_filtered_count, condition_filtered_count, len(new_rows),
+        ", ".join(f"{name}={count}" for name, count in reject_stages),
+        len(new_rows),
     )
 
     if not new_rows:
-        if total_raw > 0 and keyword_mismatch_count == len(candidates) - already_seen_count and keyword_mismatch_count > 0:
+        dominant_stage, dominant_count = max(reject_stages, key=lambda s: s[1])
+        all_lost_to_one_stage = considered > 0 and dominant_count == considered
+
+        if all_lost_to_one_stage and dominant_stage == "keyword_mismatch":
             logger.warning(
                 "Watch '%s': got %d raw listing(s) from SociaVault, but ALL of "
                 "them failed the keyword match against %s. Run with --verbose "
                 "to see sample titles and check whether your keyword variants "
                 "are too strict for how sellers actually word titles.",
                 watch.name, total_raw, watch.keywords,
+            )
+        elif all_lost_to_one_stage:
+            # The canary that was missing on 2026-08-13: when a single stage
+            # eats 100% of candidates, that is almost never a quiet market -
+            # it's a bug or an upstream API change. The get_item() envelope bug
+            # produced exactly this shape (every candidate dying at the
+            # location stage) and still logged nothing louder than "no new
+            # listings" for two days.
+            logger.warning(
+                "Watch '%s': %d candidate(s) considered, 0 survived - ALL of "
+                "them were rejected at a single stage: '%s'. One stage "
+                "rejecting 100%% of candidates usually means a systemic "
+                "failure rather than a genuinely quiet market. Full breakdown: %s",
+
+                watch.name, considered, dominant_stage,
+                ", ".join(f"{name}={count}" for name, count in reject_stages if count),
             )
         logger.info("Watch '%s': no new listings", watch.name)
         return 0

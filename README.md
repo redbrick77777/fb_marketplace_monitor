@@ -278,6 +278,23 @@ be rediscovered from scratch:
   seller's actual pin, which is what the radius re-check (see above) relies
   on. Ship-only listings with no fixed pickup point return `location: {}` on
   both endpoints - no coordinates available for those at all.
+- **Pagination is non-deterministic, and an empty page does NOT mean the end
+  of results.** A mid-sequence page frequently comes back with zero listings
+  while *later* pages still have plenty: in one probe "Breitling" returned 6
+  listings on page 1, zero on page 2, then 24 on page 3. `search_all_pages()`
+  therefore stops only when the **cursor** runs out, never on an empty page -
+  breaking early on a zero-length page silently discards most of the results.
+  Re-running the identical query minutes later returns a *different* page
+  distribution (the zero moves, and the totals differ), so this can't be
+  paced around: raising the inter-page delay from 0.5s to 2.0s did not
+  eliminate the empty pages, it only shuffled which ones were empty.
+- **Search results are not ordered by distance**, so limiting `max_pages` is
+  not a way to stay local. Measured against a 30 mi Jacksonville watch, page
+  3 was *more* local than page 1 (75% Jacksonville vs 33%); the genuinely
+  far-away listings - Los Angeles, Natick MA, McAllen TX - showed up on page
+  1, almost certainly because shipping-enabled listings surface nationwide
+  regardless of the requested radius. Cutting `max_pages` to 1 would have
+  thrown away ~20 nearby listings while keeping the out-of-state ones.
 
 If a future response shape looks "off" (e.g. a field is unexpectedly empty,
 or nested differently than expected), the fix pattern that's worked every
