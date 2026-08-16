@@ -15,4 +15,7 @@ data/*.xlsx
 output/
 logs/
 
+# Throwaway probes / diagnostics - see CLAUDE.md
+tmp/
+
 .claude/

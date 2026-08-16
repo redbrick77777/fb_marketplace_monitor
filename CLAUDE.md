@@ -33,6 +33,15 @@ This rule is about **writes**. Reading and analysis are unaffected: `grep`,
 `sqlite3` queries, `git log`, and throwaway scripts that only compute and print
 are all fine.
 
+## Throwaway scripts go in `tmp/`, inside the repo
+
+Write one-off probes, diagnostics and analysis scripts to `tmp/` in the project
+directory - not to `/tmp` or anywhere else outside it. `tmp/` is gitignored, so
+nothing lands in a commit, but the scripts stay visible alongside the code and
+can be re-run or adapted later instead of being lost.
+
+Permanent tests belong in `tests/` and are committed.
+
 ## Never run `run.py` without asking first
 
 Bash is generally permitted in this directory, so run tests, probes, queries and
