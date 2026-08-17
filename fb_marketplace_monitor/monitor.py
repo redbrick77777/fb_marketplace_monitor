@@ -33,6 +33,32 @@ def resolve_watch_location(
     return lat, lng
 
 
+def is_offsite_listing(listing: dict) -> bool:
+    """Is this a partner listing fulfilled off Facebook (eBay and similar)?
+
+    Detected from the SEARCH response's `delivery_types`, so it costs nothing:
+    partner listings come back as `{"0": "SHIPPING_OFFSITE"}` while genuine
+    ones always include IN_PERSON (alone, or with PUBLIC_MEETUP /
+    SHIPPING_ONSITE / DOOR_*). Measured over 68 live listings on 2026-08-16:
+    3 were SHIPPING_OFFSITE, and it never appeared alongside IN_PERSON.
+
+    There is no other tell. The word "ebay" appears NOWHERE in either the
+    search or item-detail payload - the eBay branding is Facebook's own UI,
+    so `exclude_keywords` can never match it. And `strikethrough_price` is
+    not a proxy: 0 of 3 offsite listings had one, while 17 of 65 ordinary
+    listings did (it just means the seller cut their price), so filtering on
+    it would discard real listings and catch none of these.
+
+    Worth doing before the item-detail fetch, because these listings return an
+    empty `location` there - so today we pay a credit and then drop them as
+    "no coordinates", which also makes them indistinguishable in the logs from
+    genuine ship-only listings by real sellers.
+    """
+    delivery_types = listing.get("delivery_types") or {}
+    values = delivery_types.values() if isinstance(delivery_types, dict) else delivery_types
+    return any(str(v).upper() == "SHIPPING_OFFSITE" for v in values)
+
+
 def _listing_city(listing: dict) -> Optional[str]:
     """A geocodable "City, State" string from the SEARCH response - free.
 
@@ -146,6 +172,7 @@ def run_watch(
     # a listing; it'll simply be picked up again on the next real run.
     pending_seen_ids: list[str] = []
     already_seen_count = 0
+    offsite_count = 0
     keyword_mismatch_count = 0
     excluded_count = 0
     price_filtered_count = 0
@@ -163,6 +190,14 @@ def run_watch(
     for listing_id, listing in candidates.items():
         if store.has_seen(watch.name, listing_id):
             already_seen_count += 1
+            continue
+
+        # Free, and first: an off-Facebook partner listing (eBay et al) can
+        # never be inspected or picked up locally, and its item detail carries
+        # no seller pin - so there is nothing further worth spending on it.
+        if watch.exclude_offsite and is_offsite_listing(listing):
+            offsite_count += 1
+            store.mark_seen(watch.name, listing_id)
             continue
 
         title = listing.get("title", "")
@@ -309,6 +344,7 @@ def run_watch(
     # sync with the counters above - it drives both the summary line and the
     # all-dropped alarm below.
     reject_stages = [
+        ("offsite_partner_listing", offsite_count),
         ("keyword_mismatch", keyword_mismatch_count),
         ("excluded_keyword", excluded_count),
         ("price_filtered", price_filtered_count),

@@ -296,6 +296,23 @@ be rediscovered from scratch:
   regardless of the requested radius. Cutting `max_pages` to 1 would have
   thrown away ~20 nearby listings while keeping the out-of-state ones.
 
+- **eBay/partner listings are invisible to keyword filters, and the same
+  listing looks different in search vs item detail.** Facebook surfaces
+  "Buy now on eBay" listings in Marketplace results, but the word *ebay*
+  appears **nowhere** in either payload - the branding is Facebook's own UI,
+  so `exclude_keywords` can never match it. The only marker is
+  `delivery_types` = `SHIPPING_OFFSITE`, which appears alone and never
+  alongside `IN_PERSON` (3 of 68 sampled listings, 2026-08-16). Note the
+  inversion: in the **search** response these carry a normal-looking
+  `location` and `price.amount`, but their **item detail** returns
+  `location: {}`, `price.amount: null` and `seller: null` - which is why they
+  used to survive until the item fetch and then get binned as "no
+  coordinates". `exclude_offsite` (default true) now drops them from the
+  search response, before a credit is spent.
+  `strikethrough_price` is **not** a usable signal for this: 0 of 3 offsite
+  listings had one while 17 of 65 ordinary listings did - it just means the
+  seller reduced their price.
+
 If a future response shape looks "off" (e.g. a field is unexpectedly empty,
 or nested differently than expected), the fix pattern that's worked every
 time so far: get the **raw** response via `curl` directly (bypassing our

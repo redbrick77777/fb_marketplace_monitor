@@ -48,6 +48,17 @@ watches:
     condition_filter: "used"           # omit this line entirely to skip the condition check
     max_pages: 5                       # search result pages to pull per keyword, per run
 
+    # Drop "buy it on eBay"-style partner listings that Facebook surfaces but
+    # fulfils off-site (delivery type SHIPPING_OFFSITE). Defaults to true, so
+    # you only need this line to turn it OFF.
+    #
+    # They can't be inspected or picked up in person, and their item detail
+    # comes back with an empty location, so they'd be dropped later anyway -
+    # this just drops them before spending a credit on that fetch. Note the
+    # word "ebay" appears nowhere in the API response (it's Facebook's own
+    # branding), so exclude_keywords cannot catch these.
+    exclude_offsite: true
+
     # --- Output: pick ONE of the two blocks below ---
 
     # Option A (default, zero setup): write to a local .xlsx file.

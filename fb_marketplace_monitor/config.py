@@ -28,6 +28,11 @@ class WatchConfig:
     exclude_keywords: list[str] = field(default_factory=list)
     condition_filter: Optional[str] = None  # e.g. "used" or "new"; omit to skip the check
     max_pages: int = 5
+    # Drop listings fulfilled off Facebook (delivery type SHIPPING_OFFSITE) -
+    # eBay and similar partner listings. Defaults ON: they can't be inspected
+    # or collected in person, and their item detail carries no seller pin, so
+    # they're unusable for a local-pickup watch. See monitor.is_offsite_listing.
+    exclude_offsite: bool = True
 
     @property
     def radius_km(self) -> int:
@@ -118,6 +123,7 @@ def load_config(path: str) -> AppConfig:
                 exclude_keywords=w.get("exclude_keywords", []) or [],
                 condition_filter=w.get("condition_filter"),
                 max_pages=int(w.get("max_pages", 5)),
+                exclude_offsite=bool(w.get("exclude_offsite", True)),
             )
         )
 

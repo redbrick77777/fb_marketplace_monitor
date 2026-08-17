@@ -218,11 +218,66 @@ def test_envelope_bug_is_loud(workdir: Path) -> None:
     )
 
 
+def test_offsite_detection() -> None:
+    """Shapes taken from real 2026-08-16 search responses."""
+    from fb_marketplace_monitor.monitor import is_offsite_listing
+
+    ebay = {"delivery_types": {"0": "SHIPPING_OFFSITE"},
+            "strikethrough_price": {"formatted_amount": "$2,800"}}
+    in_person = {"delivery_types": {"0": "IN_PERSON"}}
+    onsite = {"delivery_types": {"0": "IN_PERSON", "1": "SHIPPING_ONSITE"}}
+    meetup = {"delivery_types": {"0": "IN_PERSON", "1": "PUBLIC_MEETUP"}}
+    door = {"delivery_types": {"0": "DOOR_DROPOFF", "1": "DOOR_PICKUP",
+                               "2": "IN_PERSON", "3": "PUBLIC_MEETUP"}}
+    # A perfectly ordinary listing whose seller just cut the price. 17 of 65
+    # real listings looked like this - it must NOT be treated as offsite.
+    price_cut = {"delivery_types": {"0": "IN_PERSON"},
+                 "strikethrough_price": {"formatted_amount": "$3,000"}}
+    empty = {"delivery_types": {}}
+
+    print("\nOffsite (eBay/partner) detection:")
+    check("SHIPPING_OFFSITE is detected", is_offsite_listing(ebay))
+    check("plain IN_PERSON is not", not is_offsite_listing(in_person))
+    check("IN_PERSON + SHIPPING_ONSITE is not (on-site shipping is fine)",
+          not is_offsite_listing(onsite))
+    check("IN_PERSON + PUBLIC_MEETUP is not", not is_offsite_listing(meetup))
+    check("DOOR_* combination is not", not is_offsite_listing(door))
+    check("a price-cut listing is NOT offsite (strikethrough is not a signal)",
+          not is_offsite_listing(price_cut))
+    check("missing/empty delivery_types is not offsite (fail open)",
+          not is_offsite_listing(empty) and not is_offsite_listing({}))
+
+
+def test_offsite_costs_no_item_credit(workdir: Path) -> None:
+    """The whole point: reject before paying for item detail."""
+    store = Store(str(workdir / "offsite.db"))
+    store.cache_location(WATCH.city, *JAX)
+
+    listings = [
+        make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida"),
+        dict(make_listing("ebay1", "Rolex Sea-Dweller", "Citrus Heights", "California"),
+             delivery_types={"0": "SHIPPING_OFFSITE"}),
+        dict(make_listing("ebay2", "Rolex Datejust", "Jacksonville", "Florida"),
+             delivery_types={"0": "SHIPPING_OFFSITE"}),
+    ]
+    client = StubClient(listings)
+    run_watch(client, None, XlsxWriter(), store, WATCH, dry_run=True)
+
+    print("\nOffsite listings cost nothing:")
+    check("neither offsite listing triggered an item fetch",
+          "ebay1" not in client.get_item_calls and "ebay2" not in client.get_item_calls)
+    check("a local offsite listing is still rejected (not just far ones)",
+          "ebay2" not in client.get_item_calls)
+    check("the genuine listing was still fetched", "in_range" in client.get_item_calls)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.CRITICAL)  # keep app logs out of the report
     workdir = Path(tempfile.mkdtemp(prefix="fbmm-tests-"))
     try:
         test_prefilter(workdir)
+        test_offsite_detection()
+        test_offsite_costs_no_item_credit(workdir)
         test_envelope_bug_is_loud(workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
