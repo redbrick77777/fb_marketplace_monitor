@@ -18,6 +18,7 @@ import logging
 import shutil
 import sys
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -75,7 +76,12 @@ class StubClient:
         if pin == "RAISE":
             raise SociaVaultError("simulated transport failure")
         location = {} if pin is None else {"latitude": pin[0], "longitude": pin[1]}
-        return {"description": "a lovely Rolex watch", "location": location, "attributes": []}
+        return {
+            "description": "a lovely Rolex watch",
+            "location": location,
+            "attributes": [],
+            "creation_time": "2026-08-21T00:11:08.000Z",
+        }
 
 
 class EnvelopeBugClient(StubClient):
@@ -271,6 +277,76 @@ def test_offsite_costs_no_item_credit(workdir: Path) -> None:
     check("the genuine listing was still fetched", "in_range" in client.get_item_calls)
 
 
+def test_posted_date_extraction() -> None:
+    """Shapes taken from real 2026-08-25 item-detail responses."""
+    from fb_marketplace_monitor.monitor import _extract_posted_date
+
+    print("\nPosted-At extraction:")
+    # Midday UTC on purpose: local and UTC agree on the date here, so this
+    # assertion is about the format alone. The zone is the next check's job.
+    check(
+        "a real creation_time becomes a bare ISO date",
+        _extract_posted_date({"creation_time": "2026-08-04T15:32:28.000Z"}) == "2026-08-04",
+    )
+    # The whole reason this is local and not UTC: the sibling tool's "Closed"
+    # column is stamped with a local datetime.now(), and "on market" subtracts
+    # the two. A UTC date here would read a day high all evening.
+    local_offset = datetime.now().astimezone().utcoffset()
+    expected = "2026-08-20" if local_offset < timedelta(0) else "2026-08-21"
+    check(
+        "a just-after-midnight UTC stamp resolves to the LOCAL date",
+        _extract_posted_date({"creation_time": "2026-08-21T00:11:08.000Z"}) == expected,
+    )
+    check(
+        "a null creation_time (offsite listings) yields empty, not a guess",
+        _extract_posted_date({"creation_time": None}) == "",
+    )
+    check("a missing field yields empty", _extract_posted_date({}) == "")
+    check("a failed item fetch yields empty", _extract_posted_date(None) == "")
+    check(
+        "the human 'Listed 3 weeks ago' text is never used - it can't be subtracted",
+        _extract_posted_date(
+            {"creation_time": None, "listing_date_text": "Listed 3 weeks ago"}
+        ) == "",
+    )
+    check(
+        "garbage doesn't crash the run, it just leaves the cell empty",
+        _extract_posted_date({"creation_time": "not a date"}) == "",
+    )
+
+
+def test_row_layout(workdir: Path) -> None:
+    """Column A is the found-date and the listing id is gone from the row.
+
+    The id lived in A until 2026-08-25 and nothing ever read it back, while
+    Sheets rounded 27% of the values into corruption. This asserts it stays
+    gone - and that the id is still recoverable from the link, which is the
+    only place it now survives."""
+    store = Store(str(workdir / "layout.db"))
+    store.cache_location(WATCH.city, *JAX)
+
+    captured: list[list] = []
+
+    class CapturingWriter:
+        def append_rows(self, file_path, tab_name, rows):
+            captured.extend(rows)
+
+    client = StubClient([make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida")])
+    run_watch(client, None, CapturingWriter(), store, WATCH, dry_run=False)
+
+    print("\nRow layout:")
+    check("a row was written", len(captured) == 1)
+    row = captured[0] if captured else [""] * 7
+    check("still exactly 7 columns (A-G), so nothing downstream shifts", len(row) == 7)
+    check("A is the found-date, not the listing id", row[0].endswith(" UTC"))
+    check("the raw listing id appears in no cell of its own", "in_range" not in row)
+    check("...but is still recoverable from the link in E", row[4].endswith("/in_range/"))
+    check("F is the posted date as a bare date", len(row[5]) == 10 and row[5].count("-") == 2)
+    check("B/C/D still hold title, price and distance", row[1] == "Rolex Submariner"
+          and row[2] == "$1000" and row[3] == "15.8")
+    check("G still holds the watch name", row[6] == "testwatch")
+
+
 def main() -> int:
     logging.basicConfig(level=logging.CRITICAL)  # keep app logs out of the report
     workdir = Path(tempfile.mkdtemp(prefix="fbmm-tests-"))
@@ -278,6 +354,8 @@ def main() -> int:
         test_prefilter(workdir)
         test_offsite_detection()
         test_offsite_costs_no_item_credit(workdir)
+        test_posted_date_extraction()
+        test_row_layout(workdir)
         test_envelope_bug_is_loud(workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -327,14 +327,18 @@ def run_watch(
                 continue
 
         formatted_price = (listing.get("price") or {}).get("formatted_amount", str(price or ""))
+        # The listing id deliberately isn't a column of its own: Sheets stores
+        # a bare number at ~15 significant digits, so 16- and 17-digit ids were
+        # silently rounded (27% of them corrupted) and nothing ever read the
+        # column back. The id is intact in the link, which is stored as text.
         new_rows.append(
             [
-                listing_id,
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                 title,
                 formatted_price,
                 f"{distance_miles:.1f}",
                 listing_link(listing_id),
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                _extract_posted_date(item_detail_for_location),
                 watch.name,
             ]
         )
@@ -453,6 +457,40 @@ def _extract_location(item: Optional[dict]) -> Optional[tuple[float, float]]:
     if lat is None or lng is None:
         return None
     return lat, lng
+
+
+def _extract_posted_date(item: Optional[dict]) -> str:
+    """When the seller actually posted the listing, as a bare local date.
+
+    Costs nothing: item detail is already fetched for every listing that gets
+    this far (the seller-pin radius check above needs it), and the search
+    response carries the field but leaves it null.
+
+    Three deliberate choices:
+
+    - **Bare date, not a timestamp.** Written with USER_ENTERED, a bare
+      `2026-08-21` lands in Sheets as a real date; the "Date Found" column's
+      `... UTC` suffix makes that one text, which no formula can subtract.
+    - **Local time, not UTC**, unlike every other timestamp this project
+      writes. The sibling evaluation tool stamps its "Closed" column with a
+      local `datetime.now()`, and "on market" is Closed minus Posted - mixing
+      the two zones would put anything posted after 20:00 EDT a day out.
+    - **Empty when absent**, never the `listing_date_text` ("Listed 3 weeks
+      ago") sitting beside it in the response. That field is prose, and prose
+      in a date column breaks the same arithmetic.
+    """
+    if not item:
+        return ""
+    raw = item.get("creation_time")
+    if not raw:
+        return ""
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except (AttributeError, ValueError):
+        logger.warning(
+            "Unparseable creation_time %r - leaving Posted At empty for this row.", raw
+        )
+        return ""
 
 
 def _extract_condition(item: Optional[dict]) -> Optional[str]:

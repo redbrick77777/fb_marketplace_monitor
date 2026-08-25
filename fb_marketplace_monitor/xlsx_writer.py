@@ -19,7 +19,7 @@ from openpyxl import Workbook, load_workbook
 
 logger = logging.getLogger(__name__)
 
-HEADER_ROW = ["Listing ID", "Title", "Price", "Distance (mi)", "Link", "Date Found", "Watch"]
+HEADER_ROW = ["Date Found", "Title", "Price", "Distance (mi)", "Link", "Posted At", "Watch"]
 
 
 class XlsxWriter:
