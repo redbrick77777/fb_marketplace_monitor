@@ -142,6 +142,58 @@ other scheduled scripts too. Setup is the same `crontab -e` line above, just
 without the macOS quirks; if using xlsx output, remember to pull the file
 down (`scp`) or sync it somewhere to actually view it.
 
+## Optional: Telegram alerts for rare finds
+
+Some watches match constantly; others match once every few days but matter
+when they do (one specific tire size, a particular boat model). For the
+second kind, waiting to notice a new spreadsheet row is the weak link. Set
+`notify: true` on those watches and the monitor pushes a Telegram message the
+moment it writes them.
+
+**Know the ceiling first:** cron runs every 3 hours, so an alert can land up
+to 3 hours after the seller posted. The notification channel isn't the
+limiting factor - the polling interval is. Running a watch more often costs
+1 SociaVault credit per search page per run (item-detail credits don't
+increase: every listing is considered exactly once regardless of how often
+you poll).
+
+Setup, once:
+
+1. In Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`
+   and follow the prompts. It replies with a bot token.
+2. Put the token in `config.yaml`:
+
+   ```yaml
+   notifications:
+     telegram:
+       bot_token: "123456789:AA..."
+       chat_id: ""          # next step fills this in
+   ```
+
+   (Or keep it out of the file entirely and export `TELEGRAM_BOT_TOKEN` /
+   `TELEGRAM_CHAT_ID` instead - env vars win over the YAML.)
+3. Open your new bot in Telegram and send it any message. **The bot can't
+   message you until you write to it first** - this is a Telegram rule, not
+   a quirk of this script.
+4. Run `venv/bin/python3 tmp/get_telegram_chat_id.py`, which reads the token
+   from the config and prints your `chat_id`. Paste it into `config.yaml`.
+5. Add `notify: true` to whichever watches should alert you.
+
+Then `python run.py --watch YOUR_WATCH --dry-run` to confirm the config
+loads. Note dry runs deliberately send nothing - the first real alert
+arrives with the next genuine find.
+
+Behaviour worth knowing:
+
+- **One message per watch per run**, listing every new find - not one message
+  per listing.
+- **A failed send never costs a listing.** By the time the notifier runs the
+  rows are already written and marked seen, so an outage loses the alert and
+  nothing else; the run still succeeds and the log says what happened.
+- **Missing credentials are a startup error**, not a warning. A watch that
+  says `notify: true` and then silently never notifies is the worst case:
+  you'd stop checking the sheet, trusting an alert that isn't coming.
+
 ## CLI reference
 
 ```
@@ -331,6 +383,7 @@ fb_marketplace_monitor/
   xlsx_writer.py         # local .xlsx output backend (default, no setup)
   sheets_client.py        # Google Sheets output backend (service account auth)
   store.py               # SQLite dedupe store + location cache
+  notify.py              # optional Telegram push for watches with notify: true
   monitor.py             # ties it all together per watch, picks the output backend
   cli.py                 # argparse entrypoint
 run.py                  # `python run.py ...` - what cron calls

@@ -33,6 +33,11 @@ class WatchConfig:
     # or collected in person, and their item detail carries no seller pin, so
     # they're unusable for a local-pickup watch. See monitor.is_offsite_listing.
     exclude_offsite: bool = True
+    # Push a Telegram message when this watch finds something. Off by default:
+    # it's meant for watches that match rarely (a specific tire size, roughly
+    # once every three days), not for the ones that match dozens of times a
+    # day. See notifications in AppConfig for the credentials it needs.
+    notify: bool = False
 
     @property
     def radius_km(self) -> int:
@@ -50,6 +55,17 @@ class WatchConfig:
 
 
 @dataclass
+class TelegramConfig:
+    bot_token: str
+    chat_id: str
+
+
+@dataclass
+class NotificationsConfig:
+    telegram: Optional[TelegramConfig] = None
+
+
+@dataclass
 class AppConfig:
     sociavault_api_key: str
     watches: list[WatchConfig]
@@ -57,6 +73,7 @@ class AppConfig:
     db_path: str = "data/seen_listings.db"
     log_file: Optional[str] = None
     request_timeout: int = 15
+    notifications: Optional[NotificationsConfig] = None  # only needed if a watch sets notify: true
 
 
 def _require(d: dict, key: str, context: str):
@@ -124,6 +141,7 @@ def load_config(path: str) -> AppConfig:
                 condition_filter=w.get("condition_filter"),
                 max_pages=int(w.get("max_pages", 5)),
                 exclude_offsite=bool(w.get("exclude_offsite", True)),
+                notify=bool(w.get("notify", False)),
             )
         )
 
@@ -147,6 +165,8 @@ def load_config(path: str) -> AppConfig:
         if not Path(creds_file).exists():
             raise FileNotFoundError(f"Google service account file not found: {creds_file}")
 
+    notifications = _load_notifications(raw, watches)
+
     return AppConfig(
         sociavault_api_key=api_key,
         google_service_account_file=creds_file,
@@ -154,4 +174,40 @@ def load_config(path: str) -> AppConfig:
         db_path=raw.get("db_path", "data/seen_listings.db"),
         log_file=raw.get("log_file"),
         request_timeout=int(raw.get("request_timeout", 15)),
+        notifications=notifications,
     )
+
+
+def _load_notifications(raw: dict, watches: list[WatchConfig]) -> Optional[NotificationsConfig]:
+    """Telegram credentials, required only if some watch asks to be notified.
+
+    Missing credentials are a hard error rather than a warning, and the error
+    lands here at config load - before a single credit is spent. A watch that
+    says notify: true and then silently never notifies is the worst outcome
+    available: you'd stop watching the sheet, trusting an alert that isn't
+    coming.
+    """
+    telegram_raw = (raw.get("notifications") or {}).get("telegram") or {}
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or telegram_raw.get("bot_token")
+    # chat_id is numeric in YAML (and negative for groups) - keep it a string.
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or telegram_raw.get("chat_id")
+
+    wants_notifying = [w.name for w in watches if w.notify]
+    if wants_notifying:
+        missing = [
+            name
+            for name, value in (("bot_token", token), ("chat_id", chat_id))
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"Watch(es) {', '.join(wants_notifying)} set notify: true, but "
+                f"notifications.telegram.{' and .'.join(missing)} "
+                f"{'is' if len(missing) == 1 else 'are'} missing. Set "
+                f"{'it' if len(missing) == 1 else 'them'} in the config (or via "
+                "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), or remove notify: true."
+            )
+
+    if not token or not chat_id:
+        return None
+    return NotificationsConfig(telegram=TelegramConfig(bot_token=token, chat_id=str(chat_id)))

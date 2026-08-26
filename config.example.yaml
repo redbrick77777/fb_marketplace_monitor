@@ -2,7 +2,8 @@
 #   cp config.example.yaml config.yaml
 #
 # Secrets can also be supplied via environment variables instead of putting
-# them in this file: SOCIAVAULT_API_KEY, GOOGLE_SERVICE_ACCOUNT_FILE
+# them in this file: SOCIAVAULT_API_KEY, GOOGLE_SERVICE_ACCOUNT_FILE,
+# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 # (env vars take priority over the values below, if both are set).
 
 sociavault_api_key: "sk_live_your_key_here"
@@ -16,6 +17,20 @@ db_path: "data/seen_listings.db"
 
 # Optional: also write logs to this file (in addition to stdout).
 log_file: "logs/monitor.log"
+
+# Optional: get a Telegram push when a watch finds something. Only needed if
+# some watch below sets `notify: true` - and if one does and this is missing,
+# the run refuses to start rather than quietly never notifying you.
+# See the README for how to create the bot and find your chat_id.
+#
+# Worth knowing before you turn it on: cron runs the monitor every 3 hours,
+# so an alert can arrive up to 3 hours after the seller posted. Enable it on
+# the watches that match rarely, where hearing about it at all is the win -
+# a watch that matches dozens of times a day will just become noise.
+# notifications:
+#   telegram:
+#     bot_token: "123456789:your_bot_token_from_botfather"
+#     chat_id: "123456789"
 
 # One or more searches ("watches"). Each is tracked independently for
 # dedupe purposes, and can write to its own file/sheet+tab - this is what
@@ -47,6 +62,11 @@ watches:
     price_max: 400
     condition_filter: "used"           # omit this line entirely to skip the condition check
     max_pages: 5                       # search result pages to pull per keyword, per run
+    notify: true                       # push a Telegram message when this watch finds
+                                        # something (needs the `notifications` block above).
+                                        # Defaults to false. Best on rare-but-important
+                                        # watches like this one; leave it off for anything
+                                        # that matches many times a day.
 
     # Drop "buy it on eBay"-style partner listings that Facebook surfaces but
     # fulfils off-site (delivery type SHIPPING_OFFSITE). Defaults to true, so

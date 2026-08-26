@@ -18,6 +18,7 @@ import logging
 import shutil
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -347,6 +348,150 @@ def test_row_layout(workdir: Path) -> None:
     check("G still holds the watch name", row[6] == "testwatch")
 
 
+class CapturingNotifier:
+    def __init__(self, fail: bool = False):
+        self.calls: list[tuple[str, list[dict]]] = []
+        self.fail = fail
+
+    def send(self, watch_name, listings):
+        self.calls.append((watch_name, listings))
+        if self.fail:
+            from fb_marketplace_monitor.notify import NotifyError
+
+            raise NotifyError("simulated Telegram outage")
+        return 1
+
+
+def _notify_watch(**overrides) -> WatchConfig:
+    return replace(WATCH, name="notifywatch", notify=True, **overrides)
+
+
+def test_notification_is_opt_in(workdir: Path) -> None:
+    listings = [make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida")]
+
+    print("\nNotifications are opt-in:")
+    store = Store(str(workdir / "notify-off.db"))
+    store.cache_location(WATCH.city, *JAX)
+    off = CapturingNotifier()
+    run_watch(StubClient(listings), None, XlsxWriter(), store, WATCH, dry_run=True, notifier=off)
+    check("a watch without notify: true is never notified", off.calls == [])
+
+    store = Store(str(workdir / "notify-dry.db"))
+    store.cache_location(WATCH.city, *JAX)
+    dry = CapturingNotifier()
+    run_watch(
+        StubClient(listings), None, XlsxWriter(), store, _notify_watch(),
+        dry_run=True, notifier=dry,
+    )
+    check("--dry-run sends nothing, even with notify: true", dry.calls == [])
+
+
+def test_notification_content(workdir: Path) -> None:
+    store = Store(str(workdir / "notify-on.db"))
+    store.cache_location(WATCH.city, *JAX)
+    notifier = CapturingNotifier()
+
+    class NullWriter:
+        def append_rows(self, *args):
+            pass
+
+    listings = [
+        make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida"),
+        make_listing("no_state", "Rolex Daytona", display="Saint Johns"),
+    ]
+    run_watch(
+        StubClient(listings), None, NullWriter(), store, _notify_watch(),
+        dry_run=False, notifier=notifier,
+    )
+
+    print("\nNotification content:")
+    check("exactly one notification per run, not one per listing", len(notifier.calls) == 1)
+    name, sent = notifier.calls[0] if notifier.calls else ("", [])
+    check("it carries every new listing", len(sent) == 2)
+    check("named by watch", name == "notifywatch")
+    first = sent[0] if sent else {}
+    check(
+        "each listing carries what you need to act: title, price, distance, link, posted",
+        first.get("title") == "Rolex Submariner"
+        and first.get("price") == "$1000"
+        and first.get("distance") == "15.8"
+        and first.get("link", "").endswith("/in_range/")
+        and len(first.get("posted", "")) == 10,
+    )
+
+
+def test_notification_failure_costs_only_the_alert(workdir: Path) -> None:
+    """The invariant that matters. By the time the notifier runs, the rows are
+    written and the ids are marked seen - and "seen" is a one-way door. If a
+    Telegram outage propagated, the run would abort after its side effects had
+    landed, and run_all would report the whole run as failed."""
+    store = Store(str(workdir / "notify-fail.db"))
+    store.cache_location(WATCH.city, *JAX)
+    written: list[list] = []
+
+    class CapturingWriter:
+        def append_rows(self, file_path, tab_name, rows):
+            written.extend(rows)
+
+    watch = _notify_watch()
+    listings = [make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida")]
+
+    print("\nA failed notification costs only the alert:")
+    try:
+        count = run_watch(
+            StubClient(listings), None, CapturingWriter(), store, watch,
+            dry_run=False, notifier=CapturingNotifier(fail=True),
+        )
+        raised = False
+    except Exception:
+        count, raised = -1, True
+
+    check("the run does not raise", not raised)
+    check("the listing is still counted as added", count == 1)
+    check("the row still reached the sheet", len(written) == 1)
+    check(
+        "and it stays marked seen - no duplicate on the next run",
+        store.has_seen(watch.name, "in_range"),
+    )
+
+
+def test_message_building() -> None:
+    from fb_marketplace_monitor.notify import (
+        MAX_LISTINGS_PER_MESSAGE,
+        build_messages,
+    )
+
+    print("\nTelegram message building:")
+    check("nothing to say means nothing sent", build_messages("w", []) == [])
+
+    # Seller titles are arbitrary text. HTML markup in a title must not be able
+    # to break the message's own markup, or Telegram rejects the whole send.
+    hostile = build_messages(
+        "w", [{"title": "<b>R&R</b> 285/70/18 <tires>", "link": "http://x/1", "price": "$450"}]
+    )[0]
+    check("a title's HTML is escaped, not interpreted", "&lt;b&gt;R&amp;R&lt;/b&gt;" in hostile)
+    check("the link survives as a real anchor", 'href="http://x/1"' in hostile)
+
+    many = build_messages("w", [{"title": f"t{i}", "link": f"http://x/{i}"} for i in range(25)])
+    check("a big batch splits rather than being dropped", len(many) == 3)
+    check("every message stays under Telegram's 4096 limit", all(len(m) < 4096 for m in many))
+    check(
+        "each message says how many landed in total",
+        all("25 new" in m for m in many),
+    )
+
+    huge = build_messages(
+        "w", [{"title": "x" * 2000, "link": "http://x/1"} for _ in range(4)]
+    )
+    check(
+        "long titles split by length too, not just by count",
+        len(huge) > 4 // MAX_LISTINGS_PER_MESSAGE and all(len(m) < 4096 for m in huge),
+    )
+
+    missing = build_messages("w", [{"title": "t", "link": "http://x/1"}])[0]
+    check("a listing with no price/distance/posted still renders", "t" in missing)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.CRITICAL)  # keep app logs out of the report
     workdir = Path(tempfile.mkdtemp(prefix="fbmm-tests-"))
@@ -356,6 +501,10 @@ def main() -> int:
         test_offsite_costs_no_item_credit(workdir)
         test_posted_date_extraction()
         test_row_layout(workdir)
+        test_notification_is_opt_in(workdir)
+        test_notification_content(workdir)
+        test_notification_failure_costs_only_the_alert(workdir)
+        test_message_building()
         test_envelope_bug_is_loud(workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

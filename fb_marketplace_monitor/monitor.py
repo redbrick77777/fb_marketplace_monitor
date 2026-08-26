@@ -8,6 +8,7 @@ from typing import Optional
 from .config import AppConfig, WatchConfig
 from .geo import haversine_miles
 from .matching import matches_any_keyword, matches_exclusions, to_broad_query
+from .notify import TelegramNotifier
 from .sheets_client import SheetsClient
 from .sociavault_client import SociaVaultClient, SociaVaultError
 from .store import Store
@@ -116,6 +117,7 @@ def run_watch(
     store: Store,
     watch: WatchConfig,
     dry_run: bool = False,
+    notifier: Optional[TelegramNotifier] = None,
 ) -> int:
     """Runs a single watch end-to-end. Returns the number of new rows added."""
     logger.info("Running watch '%s' (%s, %s mi radius)", watch.name, watch.city, watch.radius_miles)
@@ -167,6 +169,11 @@ def run_watch(
         )
 
     new_rows = []
+    # The same finds again, as dicts, for the optional Telegram push. Kept
+    # beside new_rows rather than parsed back out of it: the row is a
+    # positional list whose layout has already changed once, and a notifier
+    # reading row[5] would break silently the next time it does.
+    new_listings: list[dict] = []
     # Listing IDs are only marked "seen" once the write actually succeeds
     # (see below) - not here - so a failed write or a --dry-run never loses
     # a listing; it'll simply be picked up again on the next real run.
@@ -342,6 +349,15 @@ def run_watch(
                 watch.name,
             ]
         )
+        new_listings.append(
+            {
+                "title": title,
+                "price": formatted_price,
+                "distance": f"{distance_miles:.1f}",
+                "link": listing_link(listing_id),
+                "posted": _extract_posted_date(item_detail_for_location),
+            }
+        )
         pending_seen_ids.append(listing_id)
 
     # Every way a candidate can be rejected, in pipeline order. Keep this in
@@ -409,9 +425,10 @@ def run_watch(
 
     if dry_run:
         logger.info(
-            "Watch '%s': %d new listing(s) (dry run - not written, not marked seen)",
+            "Watch '%s': %d new listing(s) (dry run - not written, not marked seen%s)",
             watch.name,
             len(new_rows),
+            ", not notified" if watch.notify else "",
         )
     else:
         if watch.output_type == "google_sheets":
@@ -424,6 +441,23 @@ def run_watch(
         for listing_id in pending_seen_ids:
             store.mark_seen(watch.name, listing_id)
         logger.info("Watch '%s': %d new listing(s) added", watch.name, len(new_rows))
+
+        # Strictly last, and strictly non-fatal. The rows are written and the
+        # ids are marked seen by this point, so a failure here costs one
+        # notification and nothing else. Raising instead would abort the watch
+        # after its side effects had already landed, and run_all would report
+        # the whole run as failed over an undelivered message.
+        if watch.notify and notifier is not None:
+            try:
+                notifier.send(watch.name, new_listings)
+                logger.info("Watch '%s': notified about %d listing(s)", watch.name, len(new_listings))
+            except Exception as exc:
+                logger.warning(
+                    "Watch '%s': %d listing(s) were saved, but the Telegram "
+                    "notification failed: %s. The listings are in the sheet - "
+                    "only the alert was lost.",
+                    watch.name, len(new_listings), exc,
+                )
 
     for row in new_rows:
         logger.info("  + %s - %s - %s", row[1], row[2], row[3])
@@ -516,11 +550,21 @@ def run_all(config: AppConfig, only_watch: Optional[str] = None, dry_run: bool =
     if any(w.output_type == "google_sheets" for w in watches):
         sheets = SheetsClient(config.google_service_account_file)
 
+    # Same shape: only build it if some watch in this run actually wants it.
+    # load_config has already refused to start if one does and the credentials
+    # are absent, so reaching here with notify: true means they're present.
+    notifier = None
+    if any(w.notify for w in watches) and config.notifications and config.notifications.telegram:
+        telegram = config.notifications.telegram
+        notifier = TelegramNotifier(telegram.bot_token, telegram.chat_id, timeout=config.request_timeout)
+
     total_new = 0
     had_error = False
     for watch in watches:
         try:
-            total_new += run_watch(client, sheets, xlsx_writer, store, watch, dry_run=dry_run)
+            total_new += run_watch(
+                client, sheets, xlsx_writer, store, watch, dry_run=dry_run, notifier=notifier
+            )
         except Exception:
             logger.exception("Watch '%s' failed unexpectedly", watch.name)
             had_error = True
