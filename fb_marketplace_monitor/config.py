@@ -1,12 +1,15 @@
 """Configuration loading and validation for the FB Marketplace monitor."""
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 MILES_TO_KM = 1.60934
 
@@ -179,15 +182,19 @@ def load_config(path: str) -> AppConfig:
 
 
 def _load_notifications(raw: dict, watches: list[WatchConfig]) -> Optional[NotificationsConfig]:
-    """Telegram credentials, required only if some watch asks to be notified.
+    """Telegram credentials, used only by watches that ask to be notified.
 
-    Missing credentials are a hard error rather than a warning, and the error
-    lands here at config load - before a single credit is spent. A watch that
-    says notify: true and then silently never notifies is the worst outcome
-    available: you'd stop watching the sheet, trusting an alert that isn't
-    coming.
+    Missing credentials are logged loudly and then ignored. They are NOT a
+    startup error: notifications are an optional extra on top of the real job,
+    and refusing to start would take down every watch - including the ones
+    that never asked for an alert - because an unrelated side channel wasn't
+    configured. The ERROR line repeats every run, which is loud enough that a
+    watch can't silently stop notifying without it showing in the log.
     """
-    telegram_raw = (raw.get("notifications") or {}).get("telegram") or {}
+    # Canonical shape is a top-level `telegram:` block. `notifications.telegram`
+    # is also accepted: it's what this shipped with in 0c8949b, and the extra
+    # nesting earned nothing with only one channel to configure.
+    telegram_raw = raw.get("telegram") or (raw.get("notifications") or {}).get("telegram") or {}
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or telegram_raw.get("bot_token")
     # chat_id is numeric in YAML (and negative for groups) - keep it a string.
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or telegram_raw.get("chat_id")
@@ -200,12 +207,16 @@ def _load_notifications(raw: dict, watches: list[WatchConfig]) -> Optional[Notif
             if not value
         ]
         if missing:
-            raise ValueError(
-                f"Watch(es) {', '.join(wants_notifying)} set notify: true, but "
-                f"notifications.telegram.{' and .'.join(missing)} "
-                f"{'is' if len(missing) == 1 else 'are'} missing. Set "
-                f"{'it' if len(missing) == 1 else 'them'} in the config (or via "
-                "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID), or remove notify: true."
+            logger.error(
+                "Watch(es) %s set notify: true, but telegram.%s %s missing - "
+                "those watches will run normally and write their listings, but "
+                "send NO alerts. Set %s in the config (or via TELEGRAM_BOT_TOKEN "
+                "/ TELEGRAM_CHAT_ID) to turn alerts on, or remove notify: true "
+                "to silence this.",
+                ", ".join(wants_notifying),
+                " and .".join(missing),
+                "is" if len(missing) == 1 else "are",
+                "it" if len(missing) == 1 else "them",
             )
 
     if not token or not chat_id:

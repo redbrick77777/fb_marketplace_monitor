@@ -19,8 +19,9 @@ db_path: "data/seen_listings.db"
 log_file: "logs/monitor.log"
 
 # Optional: get a Telegram push when a watch finds something. Only needed if
-# some watch below sets `notify: true` - and if one does and this is missing,
-# the run refuses to start rather than quietly never notifying you.
+# some watch below sets `notify: true`. If one does and this is missing, the
+# run carries on as normal and logs an ERROR naming that watch - alerts are
+# an extra, and never a reason for the monitor to stop collecting.
 # See the README for how to create the bot and find your chat_id.
 #
 # Worth knowing before you turn it on: cron runs the monitor every 3 hours,
@@ -30,10 +31,9 @@ log_file: "logs/monitor.log"
 #
 # Leave these as-is if you don't want alerts - they're only read by watches
 # that set `notify: true`, and nothing below does by default.
-notifications:
-  telegram:
-    bot_token: "123456789:your_bot_token_from_botfather"
-    chat_id: "123456789"           # tmp/get_telegram_chat_id.py prints yours
+telegram:
+  bot_token: "123456789:your_bot_token_from_botfather"
+  chat_id: "123456789"             # tmp/get_telegram_chat_id.py prints yours
 
 # One or more searches ("watches"). Each is tracked independently for
 # dedupe purposes, and can write to its own file/sheet+tab - this is what
@@ -67,9 +67,8 @@ watches:
     max_pages: 5                       # search result pages to pull per keyword, per run
     notify: false                      # push a Telegram message when this watch finds
                                         # something. Flip to true once you've filled in the
-                                        # `notifications` block above with a real token -
-                                        # a watch that says true without it refuses to start
-                                        # on purpose, rather than silently never alerting.
+                                        # `telegram` block above with a real token; setting
+                                        # it true without one just logs an error each run.
                                         # Best on rare-but-important watches like this one;
                                         # leave it off for anything that matches many times
                                         # a day, or the alerts become noise.

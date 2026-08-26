@@ -455,6 +455,63 @@ def test_notification_failure_costs_only_the_alert(workdir: Path) -> None:
     )
 
 
+def test_notify_without_credentials_still_runs(workdir: Path) -> None:
+    """Notifications are an extra, never a gate on the real job.
+
+    An earlier version raised here, which meant one unconfigured side channel
+    took down every watch in the config - including the ones that never asked
+    to be notified. The signal has to be a loud log line, not a dead run."""
+    from fb_marketplace_monitor.config import load_config
+
+    config_file = workdir / "no-creds.yaml"
+    config_file.write_text(
+        "sociavault_api_key: x\n"
+        "watches:\n"
+        "  - name: alerting\n"
+        "    keywords: [rolex]\n"
+        "    city: Jacksonville, FL\n"
+        "    output_type: xlsx\n"
+        "    output_file: unused.xlsx\n"
+        "    notify: true\n"
+        "  - name: quiet\n"
+        "    keywords: [tires]\n"
+        "    city: Jacksonville, FL\n"
+        "    output_type: xlsx\n"
+        "    output_file: unused.xlsx\n"
+    )
+
+    errors: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.ERROR:
+                errors.append(record.getMessage())
+
+    handler = Capture()
+    config_log = logging.getLogger("fb_marketplace_monitor.config")
+    previous = config_log.level
+    config_log.setLevel(logging.ERROR)
+    config_log.addHandler(handler)
+    try:
+        config = load_config(str(config_file))
+        loaded, failure = True, ""
+    except Exception as exc:
+        config, loaded, failure = None, False, str(exc)
+    finally:
+        config_log.removeHandler(handler)
+        config_log.setLevel(previous)
+
+    print("\nnotify: true without credentials:")
+    check(f"the config still loads ({failure})", loaded)
+    check("both watches survive, including the one not asking for alerts",
+          loaded and len(config.watches) == 2)
+    check("no notifier is configured", loaded and config.notifications is None)
+    check("but an ERROR names the watch that won't be alerting",
+          any("alerting" in e for e in errors))
+    check("and says the listings are still written",
+          any("NO alerts" in e for e in errors))
+
+
 def test_message_building() -> None:
     from fb_marketplace_monitor.notify import (
         MAX_LISTINGS_PER_MESSAGE,
@@ -504,6 +561,7 @@ def main() -> int:
         test_notification_is_opt_in(workdir)
         test_notification_content(workdir)
         test_notification_failure_costs_only_the_alert(workdir)
+        test_notify_without_credentials_still_runs(workdir)
         test_message_building()
         test_envelope_bug_is_loud(workdir)
     finally:

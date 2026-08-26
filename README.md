@@ -164,10 +164,9 @@ Setup, once:
 2. Put the token in `config.yaml`:
 
    ```yaml
-   notifications:
-     telegram:
-       bot_token: "123456789:AA..."
-       chat_id: ""          # next step fills this in
+   telegram:
+     bot_token: "123456789:AA..."
+     chat_id: ""            # next step fills this in
    ```
 
    (Or keep it out of the file entirely and export `TELEGRAM_BOT_TOKEN` /
@@ -190,9 +189,11 @@ Behaviour worth knowing:
 - **A failed send never costs a listing.** By the time the notifier runs the
   rows are already written and marked seen, so an outage loses the alert and
   nothing else; the run still succeeds and the log says what happened.
-- **Missing credentials are a startup error**, not a warning. A watch that
-  says `notify: true` and then silently never notifies is the worst case:
-  you'd stop checking the sheet, trusting an alert that isn't coming.
+- **Missing or broken credentials never stop the run.** `notify: true` with
+  no token logs an ERROR naming the affected watches and carries on: the
+  listings still get collected and written. Alerts are an extra on top of the
+  real job, so an unconfigured side channel must not take down watches that
+  never asked for one. Check the log if alerts go quiet.
 
 ## CLI reference
 
