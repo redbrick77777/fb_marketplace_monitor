@@ -512,6 +512,127 @@ def test_notify_without_credentials_still_runs(workdir: Path) -> None:
           any("NO alerts" in e for e in errors))
 
 
+def _capture_logs(level=logging.WARNING) -> tuple[list, logging.Handler, logging.Logger, int]:
+    captured: list[tuple[int, str]] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            captured.append((record.levelno, record.getMessage()))
+
+    handler = Capture()
+    log = logging.getLogger("fb_marketplace_monitor.monitor")
+    previous = log.level
+    log.setLevel(level)
+    log.addHandler(handler)
+    return captured, handler, log, previous
+
+
+def test_out_of_credits_during_search(workdir: Path) -> None:
+    """A 402 is a billing state, not a search result.
+
+    For 8 days in Sept 2026 an unpaid bill looked exactly like a quiet market:
+    exit code 0, "0 new listings", and a warning telling the user to broaden
+    their search terms."""
+    from fb_marketplace_monitor.monitor import RunState
+    from fb_marketplace_monitor.sociavault_client import SociaVaultError
+
+    class BrokeClient(StubClient):
+        def search_all_pages(self, **kwargs):
+            raise SociaVaultError("Insufficient credits", status_code=402)
+
+    store = Store(str(workdir / "broke-search.db"))
+    store.cache_location(WATCH.city, *JAX)
+    state = RunState()
+    captured, handler, log, previous = _capture_logs()
+    try:
+        count = run_watch(
+            BrokeClient([]), None, XlsxWriter(), store, WATCH, dry_run=True, run_state=state
+        )
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous)
+
+    messages = [m for _, m in captured]
+    print("\nOut of credits during search:")
+    check("nothing is collected", count == 0)
+    check("the run knows why", state.out_of_credits)
+    check("an ERROR says OUT OF CREDITS",
+          any(lvl >= logging.ERROR and "OUT OF CREDITS" in m for lvl, m in captured))
+    check(
+        "and the 'broaden your search terms' advice is SUPPRESSED - it's wrong here",
+        not any("ZERO raw listings" in m for m in messages),
+    )
+
+
+def test_out_of_credits_during_item_fetch_keeps_listings_unseen(workdir: Path) -> None:
+    """The one that actually cost listings.
+
+    A failed item fetch marks the listing seen, and seen is a one-way door.
+    On 2026-08-08 that door closed on 50 listings whose only sin was being
+    considered after the account hit zero - they were never looked at again."""
+    from fb_marketplace_monitor.monitor import RunState
+    from fb_marketplace_monitor.sociavault_client import SociaVaultError
+
+    class BrokeItemClient(StubClient):
+        def get_item(self, item_id):
+            self.get_item_calls.append(item_id)
+            raise SociaVaultError("Insufficient credits", status_code=402)
+
+    store = Store(str(workdir / "broke-item.db"))
+    store.cache_location(WATCH.city, *JAX)
+    listings = [
+        make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida"),
+        make_listing("second", "Rolex Datejust", "Neptune Beach", "Florida"),
+    ]
+    client = BrokeItemClient(listings)
+    state = RunState()
+    count = run_watch(
+        client, None, XlsxWriter(), store, WATCH, dry_run=False, run_state=state
+    )
+
+    print("\nOut of credits during item fetch:")
+    check("nothing is written", count == 0)
+    check("the run knows why", state.out_of_credits)
+    check(
+        "the listing it choked on is NOT marked seen",
+        not store.has_seen(WATCH.name, "in_range"),
+    )
+    check(
+        "and it stops rather than burning the rest of the queue",
+        not store.has_seen(WATCH.name, "second") and len(client.get_item_calls) == 1,
+    )
+
+
+def test_out_of_credits_alerts_and_fails_the_run(workdir: Path) -> None:
+    from fb_marketplace_monitor.monitor import _alert_out_of_credits
+
+    sent: list[str] = []
+
+    class AlertNotifier:
+        def send_alert(self, text):
+            sent.append(text)
+
+    class BrokenNotifier:
+        def send_alert(self, text):
+            raise RuntimeError("Telegram down")
+
+    print("\nOut-of-credits alerting:")
+    _alert_out_of_credits(AlertNotifier(), dry_run=False)
+    check("an alert goes out", len(sent) == 1)
+    check("and it says nothing was lost", "Nothing has been lost" in sent[0])
+
+    sent.clear()
+    _alert_out_of_credits(AlertNotifier(), dry_run=True)
+    check("--dry-run stays silent", sent == [])
+
+    try:
+        _alert_out_of_credits(BrokenNotifier(), dry_run=False)
+        raised = False
+    except Exception:
+        raised = True
+    check("a dead notifier doesn't become a second failure", not raised)
+
+
 def test_message_building() -> None:
     from fb_marketplace_monitor.notify import (
         MAX_LISTINGS_PER_MESSAGE,
@@ -562,6 +683,9 @@ def main() -> int:
         test_notification_content(workdir)
         test_notification_failure_costs_only_the_alert(workdir)
         test_notify_without_credentials_still_runs(workdir)
+        test_out_of_credits_during_search(workdir)
+        test_out_of_credits_during_item_fetch_keeps_listings_unseen(workdir)
+        test_out_of_credits_alerts_and_fails_the_run(workdir)
         test_message_building()
         test_envelope_bug_is_loud(workdir)
     finally:

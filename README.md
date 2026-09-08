@@ -43,6 +43,18 @@ pip install -r requirements.txt
 Sign up at [sociavault.com](https://sociavault.com) (free tier: 50 credits,
 no card needed). Copy your API key from the dashboard.
 
+**When the credits run out**, every call returns HTTP 402 and the monitor
+goes blind - it can't tell you what's listed because it can't look. That is
+treated as the failure it is, not as a quiet market: the run logs an
+`OUT OF CREDITS` error, exits non-zero, sends a Telegram alert if one is
+configured, and stops early rather than working through the queue. Listings
+it hadn't finished deciding are deliberately **not** marked seen, so nothing
+is lost - top up and the next run catches up on the backlog.
+
+This matters because the opposite behaviour cost real listings twice: an
+account that hit zero mid-run in Aug 2026 marked 50 listings seen purely
+because their item-detail fetch failed, and "seen" is a one-way door.
+
 ### 3. Configure your watches
 
 ```bash

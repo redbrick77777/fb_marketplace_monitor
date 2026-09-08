@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -110,6 +111,20 @@ def lookup_city(store: Store, city: str) -> Optional[tuple[float, float]]:
     return store.get_cached_location(city)
 
 
+@dataclass
+class RunState:
+    """What one run learns that isn't about any single watch.
+
+    Just the one fact so far: SociaVault stopped answering because the account
+    is out of money. That's a property of the account, so the first watch to
+    hit it is telling every later watch something they'd otherwise each have
+    to rediscover - and it has to reach run_all, which decides the exit code
+    and the alert.
+    """
+
+    out_of_credits: bool = False
+
+
 def run_watch(
     client: SociaVaultClient,
     sheets: Optional[SheetsClient],
@@ -118,9 +133,11 @@ def run_watch(
     watch: WatchConfig,
     dry_run: bool = False,
     notifier: Optional[TelegramNotifier] = None,
+    run_state: Optional[RunState] = None,
 ) -> int:
     """Runs a single watch end-to-end. Returns the number of new rows added."""
     logger.info("Running watch '%s' (%s, %s mi radius)", watch.name, watch.city, watch.radius_miles)
+    state = run_state if run_state is not None else RunState()
     latitude, longitude = resolve_watch_location(client, store, watch)
 
     # Query broadly per search term (Marketplace search is fuzzy about
@@ -142,6 +159,18 @@ def run_watch(
                 max_pages=watch.max_pages,
             )
         except SociaVaultError as exc:
+            if exc.is_out_of_credits:
+                # Every remaining call this run will fail identically, so stop
+                # here instead of logging the same 402 once per search term.
+                state.out_of_credits = True
+                logger.error(
+                    "Watch '%s': SociaVault is OUT OF CREDITS (HTTP 402). This is a "
+                    "billing state, not a search result - nothing below ran, and no "
+                    "conclusion can be drawn about what is or isn't listed. Top up "
+                    "the account; the monitor recovers by itself on the next run.",
+                    watch.name,
+                )
+                break
             logger.error("Search failed for watch '%s', term '%s': %s", watch.name, term, exc)
             continue
 
@@ -156,7 +185,12 @@ def run_watch(
         for listing in listings:
             candidates[listing["id"]] = listing
 
-    if total_raw == 0:
+    # Deliberately NOT warned about when the account is out of credits: the
+    # advice below ("broaden your search terms") is actively wrong then, and
+    # following it would push real config changes in response to an unpaid
+    # bill. That warning ran 88 times a day for 8 days in Sept 2026 saying
+    # exactly the wrong thing.
+    if total_raw == 0 and not state.out_of_credits:
         logger.warning(
             "Watch '%s': SociaVault returned ZERO raw listings across all search "
             "terms %s for '%s' within %s mi. This means the API itself found "
@@ -220,7 +254,7 @@ def run_watch(
             nonlocal item_detail, item_fetch_attempted
             if not item_fetch_attempted:
                 item_fetch_attempted = True
-                item_detail = _fetch_item(client, listing_id)
+                item_detail = _fetch_item(client, listing_id, state)
             return item_detail
 
         title_matches = matches_any_keyword(title, watch.keywords)
@@ -258,6 +292,11 @@ def run_watch(
             # check_description is necessarily True here - the cheap early
             # return above already dropped the alternative.
             description = _extract_description(get_item_detail())
+            if state.out_of_credits:
+                # An empty description here isn't "no keywords in it", it's "we
+                # couldn't look". Falling through would mark this listing seen
+                # as a keyword mismatch and never revisit it.
+                break
             description_matches = matches_any_keyword(description, watch.keywords)
 
         if not title_matches and not description_matches:
@@ -297,6 +336,10 @@ def run_watch(
         # fixing.
         item_detail_for_location = get_item_detail()
         if item_detail_for_location is None:
+            if state.out_of_credits:
+                # Same reasoning as above, and the reason this branch exists at
+                # all: an unpaid bill must not permanently discard listings.
+                break
             # The fetch itself failed - a transport/API problem, NOT a fact
             # about this listing. Counted separately from "no coordinates"
             # because a spike here means something is broken upstream.
@@ -328,6 +371,8 @@ def run_watch(
         # needs condition info - the search endpoint alone doesn't include it.
         if watch.condition_filter:
             condition = _extract_condition(get_item_detail())
+            if state.out_of_credits:
+                break
             if condition is not None and watch.condition_filter.lower() not in condition.lower():
                 condition_filtered_count += 1
                 store.mark_seen(watch.name, listing_id)  # durable decision - fine to record now
@@ -465,15 +510,32 @@ def run_watch(
     return len(new_rows)
 
 
-def _fetch_item(client: SociaVaultClient, listing_id: str) -> Optional[dict]:
+def _fetch_item(
+    client: SociaVaultClient, listing_id: str, state: RunState
+) -> Optional[dict]:
     """Fetches full item detail (description, condition, etc.) - costs an
     extra SociaVault credit, so callers should only invoke this when at
     least one enabled feature (check_description or condition_filter)
-    actually needs it, and at most once per listing."""
+    actually needs it, and at most once per listing.
+
+    Records credit exhaustion on `state` rather than just logging it: callers
+    mark a listing seen when this returns None, and "seen" is a one-way door.
+    On 2026-08-08 that door closed on 50 listings whose only sin was being
+    considered after the account hit zero.
+    """
     try:
         return client.get_item(listing_id)
     except SociaVaultError as exc:
-        logger.warning("Couldn't fetch item detail for %s: %s", listing_id, exc)
+        if exc.is_out_of_credits:
+            state.out_of_credits = True
+            logger.error(
+                "SociaVault is OUT OF CREDITS (HTTP 402) while fetching item %s. "
+                "Abandoning this watch; the listings it hadn't decided yet stay "
+                "unseen and will be reconsidered once the account is topped up.",
+                listing_id,
+            )
+        else:
+            logger.warning("Couldn't fetch item detail for %s: %s", listing_id, exc)
         return None
 
 
@@ -550,26 +612,61 @@ def run_all(config: AppConfig, only_watch: Optional[str] = None, dry_run: bool =
     if any(w.output_type == "google_sheets" for w in watches):
         sheets = SheetsClient(config.google_service_account_file)
 
-    # Same shape: only build it if some watch in this run actually wants it.
-    # load_config has already refused to start if one does and the credentials
-    # are absent, so reaching here with notify: true means they're present.
-    notifier = None
-    if any(w.notify for w in watches) and config.notifications and config.notifications.telegram:
-        telegram = config.notifications.telegram
-        notifier = TelegramNotifier(telegram.bot_token, telegram.chat_id, timeout=config.request_timeout)
+    # Built whenever Telegram is configured at all, not just when some watch
+    # sets notify: true - run-level alerts below use it regardless of the
+    # per-watch flags. Individual finds are still gated on watch.notify.
+    telegram = config.notifications.telegram if config.notifications else None
+    notifier = (
+        TelegramNotifier(telegram.bot_token, telegram.chat_id, timeout=config.request_timeout)
+        if telegram
+        else None
+    )
 
+    run_state = RunState()
     total_new = 0
     had_error = False
     for watch in watches:
         try:
             total_new += run_watch(
-                client, sheets, xlsx_writer, store, watch, dry_run=dry_run, notifier=notifier
+                client, sheets, xlsx_writer, store, watch,
+                dry_run=dry_run, notifier=notifier, run_state=run_state,
             )
         except Exception:
             logger.exception("Watch '%s' failed unexpectedly", watch.name)
             had_error = True
 
+    if run_state.out_of_credits:
+        # Alert first, then fail: the exit code is what cron sees, but the
+        # push is what a person sees. This run collected whatever it managed
+        # to before the account hit zero, and that much is already written.
+        _alert_out_of_credits(notifier, dry_run)
+        raise RuntimeError(
+            "SociaVault ran out of credits (HTTP 402) - this run is incomplete. "
+            "Top up the account; the next run picks up where it stopped."
+        )
+
     if had_error:
         raise RuntimeError("One or more watches failed. See the log above for details.")
 
     return total_new
+
+
+def _alert_out_of_credits(notifier: Optional[TelegramNotifier], dry_run: bool) -> None:
+    """Say it once per run, loudly, on every channel available."""
+    logger.error(
+        "SociaVault is out of credits, so this run searched nothing and can say "
+        "nothing about what is or isn't listed. Nothing was marked seen on the "
+        "way out, so no listing is lost - top up and the next run catches up."
+    )
+    if notifier is None or dry_run:
+        return
+    try:
+        notifier.send_alert(
+            "FB Marketplace monitor is blind: SociaVault is out of credits. "
+            "No listings are being collected until the account is topped up. "
+            "Nothing has been lost - the backlog is picked up on the next run."
+        )
+    except Exception as exc:
+        # Same rule as everywhere else here: an undelivered message is never
+        # allowed to become a second failure on top of the first.
+        logger.warning("Couldn't send the out-of-credits alert: %s", exc)

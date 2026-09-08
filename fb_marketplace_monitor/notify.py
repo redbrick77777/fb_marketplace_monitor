@@ -112,6 +112,16 @@ class TelegramNotifier:
             sent += 1
         return sent
 
+    def send_alert(self, text: str) -> None:
+        """An operational message about the monitor itself, not a find.
+
+        Deliberately not gated on any watch's `notify` flag: "the monitor has
+        gone blind" is worth knowing even for watches that never wanted
+        per-listing alerts, and it's the failure that took 8 days to notice
+        in Sept 2026 precisely because nothing announced it.
+        """
+        self._send_one(f"⚠️ <b>{html.escape(text)}</b>")
+
     def _send_one(self, text: str) -> None:
         payload = {
             "chat_id": self._chat_id,

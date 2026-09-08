@@ -35,7 +35,26 @@ PAGE_DELAY_SECONDS = 1.0
 
 
 class SociaVaultError(Exception):
-    """Raised for any unrecoverable SociaVault API failure."""
+    """Raised for any unrecoverable SociaVault API failure.
+
+    Carries the HTTP status when there was one, so callers can tell the
+    difference between "this listing is gone" (404) and "the account is out
+    of money" (402) without matching on message text.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_out_of_credits(self) -> bool:
+        """A billing state, not a fact about any listing or query.
+
+        This is the failure that blinded the monitor for 8 days in Sept 2026:
+        every call 402s, searches return nothing, and without this distinction
+        it reads exactly like a quiet market.
+        """
+        return self.status_code == 402
 
 
 class SociaVaultClient:
@@ -67,11 +86,14 @@ class SociaVaultClient:
                 continue
 
             if resp.status_code == 401:
-                raise SociaVaultError("Invalid SociaVault API key (401 Unauthorized).")
+                raise SociaVaultError(
+                    "Invalid SociaVault API key (401 Unauthorized).", status_code=401
+                )
 
             if resp.status_code >= 400:
                 raise SociaVaultError(
-                    f"SociaVault API error {resp.status_code} for {url}: {resp.text[:300]}"
+                    f"SociaVault API error {resp.status_code} for {url}: {resp.text[:300]}",
+                    status_code=resp.status_code,
                 )
 
             data = resp.json()
