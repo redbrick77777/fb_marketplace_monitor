@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,15 @@ class WatchConfig:
     check_description: bool = False  # fall back to checking description if title doesn't match
     price_min: Optional[int] = None
     price_max: Optional[int] = None
+    # Two ways to say "don't show me stale listings"; both optional, and a
+    # watch may set both - then the stricter one wins. See monitor._age_cutoff.
+    #
+    # posted_after is a fixed LOCAL date, inclusive: `2026-09-01` keeps
+    # listings posted at any time on September 1st. It never moves by itself.
+    # max_age_days is the rolling equivalent, measured in 24-hour periods back
+    # from the moment the run starts: `30` keeps the last 30 days, always.
+    posted_after: Optional[date] = None
+    max_age_days: Optional[int] = None
     exclude_keywords: list[str] = field(default_factory=list)
     condition_filter: Optional[str] = None  # e.g. "used" or "new"; omit to skip the check
     max_pages: int = 5
@@ -77,6 +87,75 @@ class AppConfig:
     log_file: Optional[str] = None
     request_timeout: int = 15
     notifications: Optional[NotificationsConfig] = None  # only needed if a watch sets notify: true
+
+
+def _parse_posted_after(value, context: str) -> Optional[date]:
+    """A watch's age cutoff, as a plain date.
+
+    Raises rather than falling back to "no cutoff" on bad input. A filter that
+    silently does nothing is the worst outcome here: the run looks healthy, the
+    log says nothing, and months-old listings keep arriving exactly as before -
+    which is the complaint this option exists to answer.
+
+    PyYAML already turns an unquoted `2026-09-01` into a `date`, so the string
+    branch is for `"2026-09-01"` written with quotes.
+    """
+    if value is None or value == "":
+        return None
+    # datetime is a subclass of date, so it has to be tested first. A value
+    # with a time attached (`2026-09-01 08:00:00`) keeps only the date part -
+    # the cutoff is deliberately whole-day, see WatchConfig.posted_after.
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            pass
+    raise ValueError(
+        f"Invalid posted_after {value!r} in {context} - expected a date in "
+        "YYYY-MM-DD form, e.g. 2026-09-01, or omit the key for no age limit."
+    )
+
+
+def _parse_max_age_days(value, context: str) -> Optional[int]:
+    """A watch's rolling age window, in whole days.
+
+    Rejects anything that isn't a positive whole number, for the same reason
+    _parse_posted_after does: the failure mode of guessing is a filter that
+    looks configured and silently isn't. `2.5` is refused rather than truncated
+    to 2 - a cutoff quietly half a day off is worse than being told to fix it.
+    """
+    if value is None or value == "":
+        return None
+    # bool is a subclass of int, so `max_age_days: true` would otherwise sail
+    # through as a 1-day window.
+    if isinstance(value, bool) or isinstance(value, float):
+        raise ValueError(
+            f"Invalid max_age_days {value!r} in {context} - expected a whole "
+            "number of days, e.g. 30."
+        )
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped.isdigit():
+            raise ValueError(
+                f"Invalid max_age_days {value!r} in {context} - expected a whole "
+                "number of days, e.g. 30."
+            )
+        value = int(stripped)
+    if not isinstance(value, int):
+        raise ValueError(
+            f"Invalid max_age_days {value!r} in {context} - expected a whole "
+            "number of days, e.g. 30."
+        )
+    if value < 1:
+        raise ValueError(
+            f"Invalid max_age_days {value} in {context} - must be at least 1. "
+            "Omit the key entirely for no age limit."
+        )
+    return value
 
 
 def _require(d: dict, key: str, context: str):
@@ -140,6 +219,8 @@ def load_config(path: str) -> AppConfig:
                 check_description=bool(w.get("check_description", False)),
                 price_min=w.get("price_min"),
                 price_max=w.get("price_max"),
+                posted_after=_parse_posted_after(w.get("posted_after"), context),
+                max_age_days=_parse_max_age_days(w.get("max_age_days"), context),
                 exclude_keywords=w.get("exclude_keywords", []) or [],
                 condition_filter=w.get("condition_filter"),
                 max_pages=int(w.get("max_pages", 5)),
@@ -151,6 +232,28 @@ def load_config(path: str) -> AppConfig:
     names = [w.name for w in watches]
     if len(names) != len(set(names)):
         raise ValueError("Watch names must be unique (used as the dedupe key).")
+
+    # A cutoff in the future rejects every listing there will ever be, and the
+    # run still exits 0 saying "no new listings". Not fatal - it's a plausible
+    # thing to want for a day or two - but it must never be silent.
+    today = date.today()
+    for w in watches:
+        if w.posted_after and w.max_age_days:
+            # Legal, and occasionally what you want ("last 30 days, but never
+            # before the day I reset this watch"). Said out loud anyway, so the
+            # one that's doing nothing today isn't a mystery later.
+            logger.info(
+                "Watch '%s' sets both posted_after (%s) and max_age_days (%d) - "
+                "whichever cutoff is later applies.",
+                w.name, w.posted_after, w.max_age_days,
+            )
+        if w.posted_after and w.posted_after > today:
+            logger.warning(
+                "Watch '%s' has posted_after: %s, which is in the FUTURE - it will "
+                "reject every listing until that date arrives, and the run will "
+                "still look healthy. Set it to a past date to collect anything.",
+                w.name, w.posted_after,
+            )
 
     # Only require Google credentials if at least one watch actually needs them.
     creds_file = None

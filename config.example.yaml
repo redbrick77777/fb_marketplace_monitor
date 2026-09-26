@@ -63,6 +63,30 @@ watches:
       - "wheel only"
     price_min: 0
     price_max: 400
+
+    # --- Age limit: skip stale listings. Both keys are optional. ---
+    #
+    # Facebook keeps showing months-old listings in search results, and they
+    # look exactly like new ones once they're in the sheet. The posting date
+    # comes back in the search response itself, so rejecting an old listing
+    # costs nothing - no geocode, no item-detail credit. Listings dropped for
+    # being too old are also the one rejection here that ISN'T marked seen, so
+    # widening the window later brings them back instead of losing them.
+    #
+    # max_age_days: a rolling window, in days back from each run. This is the
+    # one you usually want - it keeps working without being touched.
+    max_age_days: 30
+    #
+    # posted_after: a FIXED date instead. Inclusive, and read in local time:
+    # 2026-09-01 keeps a listing posted at 09:15 on September 1st. It's the
+    # same date shown in the "Posted At" column, so you can pick a cutoff
+    # straight off the sheet. Useful for "everything since I reset this watch",
+    # but it does not move on by itself - left alone for months it gradually
+    # stops filtering anything.
+    #posted_after: 2026-09-01
+    #
+    # Setting both is allowed; whichever cutoff is later applies.
+
     condition_filter: "used"           # omit this line entirely to skip the condition check
     max_pages: 5                       # search result pages to pull per keyword, per run
     notify: false                      # push a Telegram message when this watch finds

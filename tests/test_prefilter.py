@@ -19,7 +19,7 @@ import shutil
 import sys
 import tempfile
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -314,6 +314,272 @@ def test_posted_date_extraction() -> None:
         "garbage doesn't crash the run, it just leaves the cell empty",
         _extract_posted_date({"creation_time": "not a date"}) == "",
     )
+
+
+def test_posted_after_filter(workdir: Path) -> None:
+    """The age cutoff: stale listings out, and out for free.
+
+    Facebook keeps serving months-old listings in search results - 8 of 17 on a
+    live "macbook" probe on 2026-09-26 were from May-July. They look identical
+    to new ones once they reach the sheet.
+    """
+    cutoff = date(2026, 9, 1)
+    watch = replace(WATCH, name="agewatch", posted_after=cutoff)
+    store = Store(str(workdir / "posted-after.db"))
+    store.cache_location(WATCH.city, *JAX)
+
+    # 22:00 LOCAL on the cutoff date. East of UTC that is the next UTC day, and
+    # a cutoff built at UTC midnight would drop this listing even though the
+    # "Posted At" column - which is rendered local - shows the cutoff date.
+    cutoff_evening = datetime.combine(cutoff, time(22, 0)).astimezone(timezone.utc)
+
+    listings = [
+        dict(make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida"),
+             creation_time="2026-09-20T12:00:00.000Z"),
+        dict(make_listing("no_state", "Rolex Daytona", display="Saint Johns"),
+             creation_time=cutoff_evening.strftime("%Y-%m-%dT%H:%M:%S.000Z")),
+        dict(make_listing("old_june", "Rolex Datejust", "Neptune Beach", "Florida"),
+             creation_time="2026-06-18T19:09:54.000Z"),
+        dict(make_listing("old_july", "Rolex Explorer", "Neptune Beach", "Florida"),
+             creation_time="2026-07-25T17:45:25.000Z"),
+        dict(make_listing("undated", "Rolex GMT", "Neptune Beach", "Florida"),
+             creation_time=None),
+    ]
+    client = StubClient(listings)
+    new_rows = run_watch(client, None, XlsxWriter(), store, watch, dry_run=True)
+
+    print("\nposted_after age cutoff:")
+    check("listings posted before the cutoff are dropped", new_rows == 2)
+    check(
+        "and dropped for FREE - no item-detail credit spent on a stale listing",
+        "old_june" not in client.get_item_calls and "old_july" not in client.get_item_calls,
+    )
+    check(
+        "a stale listing is NOT marked seen, so widening the window brings it back",
+        not store.has_seen(watch.name, "old_june"),
+    )
+    check(
+        "a listing with no creation_time fails OPEN rather than being binned",
+        "undated" in client.get_item_calls,
+    )
+    if datetime.now().astimezone().utcoffset() < timedelta(0):
+        # Only meaningful west of UTC (the droplet is EDT); east of it the
+        # stamp lands on the same UTC day and asserts nothing.
+        check(
+            "(setup) the local-evening stamp really is on the NEXT UTC day",
+            cutoff_evening.date() > cutoff,
+        )
+    check(
+        "the cutoff date is inclusive and read in LOCAL time, matching Posted At",
+        "no_state" in client.get_item_calls,
+    )
+
+    # Same listings, no cutoff configured: the filter must be inert when unset.
+    store2 = Store(str(workdir / "posted-after-off.db"))
+    store2.cache_location(WATCH.city, *JAX)
+    client2 = StubClient(listings)
+    run_watch(client2, None, XlsxWriter(), store2, WATCH, dry_run=True)
+    check(
+        "without posted_after nothing is age-filtered at all",
+        "old_june" in client2.get_item_calls and "old_july" in client2.get_item_calls,
+    )
+
+
+def test_max_age_days_filter(workdir: Path) -> None:
+    """The rolling version of the same cutoff, measured in elapsed 24h periods."""
+    now = datetime.now(timezone.utc)
+
+    def stamp(days_ago: float) -> str:
+        return (now - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    watch = replace(WATCH, name="rollingwatch", max_age_days=30)
+    store = Store(str(workdir / "max-age.db"))
+    store.cache_location(WATCH.city, *JAX)
+
+    listings = [
+        dict(make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida"),
+             creation_time=stamp(2)),
+        dict(make_listing("no_state", "Rolex Daytona", display="Saint Johns"),
+             creation_time=stamp(29.5)),
+        dict(make_listing("old_31", "Rolex Datejust", "Neptune Beach", "Florida"),
+             creation_time=stamp(31)),
+        dict(make_listing("old_90", "Rolex Explorer", "Neptune Beach", "Florida"),
+             creation_time=stamp(90)),
+    ]
+    client = StubClient(listings)
+    new_rows = run_watch(client, None, XlsxWriter(), store, watch, dry_run=True)
+
+    print("\nmax_age_days rolling window:")
+    check("listings inside the window survive, ones outside don't", new_rows == 2)
+    check(
+        "just inside the window (29.5 of 30 days) still counts",
+        "no_state" in client.get_item_calls,
+    )
+    check(
+        "and the stale ones cost no item-detail credit",
+        "old_31" not in client.get_item_calls and "old_90" not in client.get_item_calls,
+    )
+    check(
+        "a stale listing is NOT marked seen here either",
+        not store.has_seen(watch.name, "old_90"),
+    )
+
+
+def test_age_cutoff_composition() -> None:
+    """posted_after and max_age_days can both be set; the stricter one wins."""
+    from fb_marketplace_monitor.monitor import _age_cutoff
+
+    now = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+    local_midnight = lambda d: datetime.combine(d, time.min).astimezone(timezone.utc)
+
+    print("\nAge cutoff composition:")
+    check("neither set means no cutoff at all", _age_cutoff(WATCH, now) is None)
+    check(
+        "posted_after alone resolves to LOCAL midnight of that date",
+        _age_cutoff(replace(WATCH, posted_after=date(2026, 9, 20)), now)
+        == local_midnight(date(2026, 9, 20)),
+    )
+    check(
+        "max_age_days alone is elapsed time back from now, not a calendar date",
+        _age_cutoff(replace(WATCH, max_age_days=7), now) == now - timedelta(days=7),
+    )
+    check(
+        "both set: a tight rolling window beats an ancient fixed date",
+        _age_cutoff(replace(WATCH, posted_after=date(2026, 1, 1), max_age_days=7), now)
+        == now - timedelta(days=7),
+    )
+    check(
+        "both set: a recent fixed date beats a loose rolling window",
+        _age_cutoff(replace(WATCH, posted_after=date(2026, 9, 20), max_age_days=365), now)
+        == local_midnight(date(2026, 9, 20)),
+    )
+
+
+def test_age_limit_config(workdir: Path) -> None:
+    """A mistyped cutoff must fail loudly. Falling back to "no cutoff" would
+    leave a healthy-looking run quietly doing nothing it was asked to do."""
+    from fb_marketplace_monitor.config import load_config
+
+    def load(line: str):
+        config_file = workdir / "age-limit.yaml"
+        config_file.write_text(
+            "sociavault_api_key: x\n"
+            "watches:\n"
+            "  - name: w\n"
+            "    keywords: [rolex]\n"
+            "    city: Jacksonville, FL\n"
+            "    output_type: xlsx\n"
+            "    output_file: unused.xlsx\n"
+            f"{line}"
+        )
+        return load_config(str(config_file)).watches[0]
+
+    def rejects(line: str) -> bool:
+        try:
+            load(line)
+            return False
+        except ValueError:
+            return True
+
+    print("\nposted_after config parsing:")
+    check("a bare YAML date is read as a date",
+          load("    posted_after: 2026-09-01\n").posted_after == date(2026, 9, 1))
+    check("a quoted string works too",
+          load('    posted_after: "2026-09-01"\n').posted_after == date(2026, 9, 1))
+    check("a timestamp keeps only its date part",
+          load("    posted_after: 2026-09-01 08:30:00\n").posted_after == date(2026, 9, 1))
+    check("omitting the key means no age limit", load("").posted_after is None)
+
+    for bad in ("last tuesday", "09/01/2026", "20260901"):
+        check(f"posted_after {bad!r} is rejected, not silently ignored",
+              rejects(f"    posted_after: {bad}\n"))
+
+    print("\nmax_age_days config parsing:")
+    check("a whole number of days is accepted",
+          load("    max_age_days: 30\n").max_age_days == 30)
+    check("a quoted number works too",
+          load('    max_age_days: "30"\n').max_age_days == 30)
+    check("omitting the key means no age limit", load("").max_age_days is None)
+    check("both keys can be set together",
+          load("    posted_after: 2026-09-01\n    max_age_days: 30\n").max_age_days == 30)
+
+    for bad in ("0", "-5", "2.5", "true", "thirty"):
+        check(f"max_age_days {bad!r} is rejected, not silently ignored",
+              rejects(f"    max_age_days: {bad}\n"))
+
+
+def test_condition_extraction() -> None:
+    """Shapes taken from a real 2026-09-26 item-detail response.
+
+    The first version of _extract_condition read `attributes` as a list of
+    dicts and matched on `label == "Condition"`. Both are wrong: it's an
+    object keyed "0", "1", ... and the name lives in `attribute_name`, while
+    `label` is the human form of the VALUE. Iterating the object yields the
+    bare string "0", so `.get()` raised AttributeError and took the whole run
+    down with it - for any watch that turned condition_filter on.
+    """
+    from fb_marketplace_monitor.monitor import _extract_condition
+
+    live = {"attributes": {"0": {"attribute_name": "Condition",
+                                 "value": "used_good",
+                                 "label": "Used - good"}}}
+    among_others = {"attributes": {
+        "0": {"attribute_name": "Brand", "value": "Apple", "label": "Apple"},
+        "1": {"attribute_name": "Condition", "value": "new", "label": "New"},
+    }}
+
+    print("\nCondition extraction:")
+    check("the real index-keyed shape is read", _extract_condition(live) == "used_good")
+    check("condition is found alongside other attributes",
+          _extract_condition(among_others) == "new")
+    check("a plain list is still tolerated",
+          _extract_condition({"attributes": [{"attribute_name": "Condition",
+                                              "value": "used_like_new"}]}) == "used_like_new")
+    check("the label is the fallback when value is absent",
+          _extract_condition({"attributes": {"0": {"attribute_name": "Condition",
+                                                   "label": "Used - fair"}}}) == "Used - fair")
+    check("no attributes means no opinion, not a crash",
+          _extract_condition({"attributes": {}}) is None
+          and _extract_condition({}) is None)
+    check("a failed item fetch yields None", _extract_condition(None) is None)
+    check("an attribute that isn't a dict is skipped rather than fatal",
+          _extract_condition({"attributes": {"0": "Condition"}}) is None)
+
+
+def test_condition_filter_end_to_end(workdir: Path) -> None:
+    """The filter has to survive a whole run against the real payload shape."""
+
+    class ConditionClient(StubClient):
+        def __init__(self, listings, condition):
+            super().__init__(listings)
+            self.condition = condition
+
+        def get_item(self, item_id):
+            item = super().get_item(item_id)
+            item["attributes"] = {"0": {"attribute_name": "Condition",
+                                        "value": self.condition,
+                                        "label": self.condition.replace("_", " ")}}
+            return item
+
+    watch = replace(WATCH, name="condwatch", condition_filter="used")
+    listings = [make_listing("in_range", "Rolex Submariner", "Neptune Beach", "Florida")]
+
+    def run(condition: str, db: str):
+        store = Store(str(workdir / db))
+        store.cache_location(WATCH.city, *JAX)
+        try:
+            return run_watch(
+                ConditionClient(listings, condition), None, XlsxWriter(), store, watch,
+                dry_run=True,
+            )
+        except Exception as exc:  # the old code raised AttributeError here
+            return f"RAISED {type(exc).__name__}"
+
+    print("\ncondition_filter end to end:")
+    kept = run("used_good", "cond-used.db")
+    dropped = run("new", "cond-new.db")
+    check("a run with condition_filter on no longer crashes", kept == 1)
+    check("a non-matching condition is filtered out", dropped == 0)
 
 
 def test_row_layout(workdir: Path) -> None:
@@ -678,6 +944,12 @@ def main() -> int:
         test_offsite_detection()
         test_offsite_costs_no_item_credit(workdir)
         test_posted_date_extraction()
+        test_posted_after_filter(workdir)
+        test_max_age_days_filter(workdir)
+        test_age_cutoff_composition()
+        test_age_limit_config(workdir)
+        test_condition_extraction()
+        test_condition_filter_end_to_end(workdir)
         test_row_layout(workdir)
         test_notification_is_opt_in(workdir)
         test_notification_content(workdir)

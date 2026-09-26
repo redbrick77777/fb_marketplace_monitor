@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 
 from .config import AppConfig, WatchConfig
@@ -59,6 +59,73 @@ def is_offsite_listing(listing: dict) -> bool:
     delivery_types = listing.get("delivery_types") or {}
     values = delivery_types.values() if isinstance(delivery_types, dict) else delivery_types
     return any(str(v).upper() == "SHIPPING_OFFSITE" for v in values)
+
+
+def _age_cutoff(watch: WatchConfig, now: datetime) -> Optional[datetime]:
+    """The instant a listing must have been posted at or after, as aware UTC.
+
+    Two ways to ask for the same thing, and a watch may set both - in which
+    case the later (stricter) of the two wins, because that's how every other
+    filter here composes: a listing has to satisfy all of them.
+
+    **posted_after** is read as LOCAL midnight, never UTC midnight. Everything
+    a human touches here is EDT - the date typed into the config, the "Posted
+    At" column (_extract_posted_date renders it local on purpose), the log
+    lines - while `creation_time` comes back from Facebook in UTC. Comparing
+    the two without converting is exactly the 4-hour error CLAUDE.md warns
+    about: with a UTC-midnight cutoff, anything posted after 20:00 EDT on the
+    cutoff date carries the *next* day's UTC stamp and would be dropped
+    despite being, to the user reading the sheet, posted on the day they asked
+    for. Inclusive of the date itself: `2026-09-01` keeps a listing posted at
+    09:15 EDT on September 1st.
+
+    **max_age_days** is elapsed time, not calendar days: 30 means the last
+    30x24 hours counted back from `now`. `now` is taken once per run and passed
+    in rather than read here, so every listing in a run is judged against the
+    same instant instead of a boundary that creeps while the loop runs.
+    """
+    cutoffs = []
+    if watch.posted_after is not None:
+        cutoffs.append(
+            datetime.combine(watch.posted_after, time.min).astimezone(timezone.utc)
+        )
+    if watch.max_age_days is not None:
+        cutoffs.append(now - timedelta(days=watch.max_age_days))
+    return max(cutoffs) if cutoffs else None
+
+
+def _age_cutoff_label(watch: WatchConfig) -> str:
+    """How the cutoff was configured, for log lines. Names the knobs the user
+    actually set, so the fix is obvious from the message alone."""
+    parts = []
+    if watch.posted_after is not None:
+        parts.append(f"posted_after={watch.posted_after}")
+    if watch.max_age_days is not None:
+        parts.append(f"max_age_days={watch.max_age_days}")
+    return " + ".join(parts) or "no age limit"
+
+
+def _listing_posted_at(listing: dict) -> Optional[datetime]:
+    """When a listing was posted, as an aware UTC datetime, from the SEARCH
+    response - so it costs nothing.
+
+    `creation_time` is present on the search payload for every listing: 17 of
+    17 on a live probe on 2026-09-26, with item detail returning byte-identical
+    values for the same ids. (_extract_posted_date's docstring claims the
+    search response leaves this null and only item detail has it. That is no
+    longer true, and the age filter would be pointless if it were - it would
+    cost a credit per listing to learn an age we already have for free.)
+
+    Returns None when the field is missing or unparseable, which callers must
+    treat as "we couldn't tell", not as "old".
+    """
+    raw = listing.get("creation_time")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _listing_city(listing: dict) -> Optional[str]:
@@ -214,6 +281,12 @@ def run_watch(
     pending_seen_ids: list[str] = []
     already_seen_count = 0
     offsite_count = 0
+    too_old_count = 0
+    # Listings the age filter could not judge because the search response
+    # carried no usable creation_time. Not a rejection - they're let through -
+    # but counted, because if this ever stops being ~0 the filter has quietly
+    # stopped filtering and nothing else would say so.
+    undated_count = 0
     keyword_mismatch_count = 0
     excluded_count = 0
     price_filtered_count = 0
@@ -228,6 +301,10 @@ def run_watch(
     out_of_range_count = 0
     condition_filtered_count = 0
 
+    # One instant for the whole run, so a rolling max_age_days window can't
+    # shift between the first candidate and the last.
+    age_cutoff = _age_cutoff(watch, datetime.now(timezone.utc))
+
     for listing_id, listing in candidates.items():
         if store.has_seen(watch.name, listing_id):
             already_seen_count += 1
@@ -240,6 +317,27 @@ def run_watch(
             offsite_count += 1
             store.mark_seen(watch.name, listing_id)
             continue
+
+        # Also free, and also before anything is spent: the search response
+        # already tells us when the seller posted this. A "macbook" search on
+        # 2026-09-26 came back with 8 of 17 listings from May-July, so this is
+        # the stage that keeps stale results out of the sheet - and doing it
+        # here means they never cost a geocode or an item credit.
+        if age_cutoff is not None:
+            posted_at = _listing_posted_at(listing)
+            if posted_at is None:
+                # "We couldn't tell", not "it's old". Fails OPEN so an upstream
+                # field change can never silently bin every listing; the count
+                # above is what makes that visible instead.
+                undated_count += 1
+            elif posted_at < age_cutoff:
+                too_old_count += 1
+                # Deliberately NOT marked seen, unlike every other rejection
+                # here. This check costs nothing, so re-deciding it each run is
+                # free - and it keeps the door open: widen the window later and
+                # these listings return. Marking them seen is a one-way door
+                # that would make widening it impossible.
+                continue
 
         title = listing.get("title", "")
 
@@ -410,6 +508,7 @@ def run_watch(
     # all-dropped alarm below.
     reject_stages = [
         ("offsite_partner_listing", offsite_count),
+        ("posted_before_cutoff", too_old_count),
         ("keyword_mismatch", keyword_mismatch_count),
         ("excluded_keyword", excluded_count),
         ("price_filtered", price_filtered_count),
@@ -421,6 +520,17 @@ def run_watch(
     ]
     considered = len(candidates) - already_seen_count
     rejected_summary = ", ".join(f"{name}={count}" for name, count in reject_stages if count)
+
+    if undated_count:
+        logger.warning(
+            "Watch '%s': %d of %d considered listing(s) carried no usable "
+            "creation_time, so the age filter (%s) could not be applied to them - "
+            "they were kept rather than dropped. This field was present on every "
+            "listing when the filter was written; if this number is large, "
+            "SociaVault has changed the search payload and the age filter is no "
+            "longer doing its job.",
+            watch.name, undated_count, considered, _age_cutoff_label(watch),
+        )
 
     # INFO, not DEBUG: cron never passes --verbose, so at DEBUG this breakdown
     # was invisible in exactly the situation it exists for. Without it the only
@@ -437,7 +547,19 @@ def run_watch(
         dominant_stage, dominant_count = max(reject_stages, key=lambda s: s[1])
         all_lost_to_one_stage = considered > 0 and dominant_count == considered
 
-        if all_lost_to_one_stage and dominant_stage == "keyword_mismatch":
+        if all_lost_to_one_stage and dominant_stage == "posted_before_cutoff":
+            # The one stage that is allowed to eat 100% of candidates without
+            # it meaning anything is broken: it means nothing new was posted
+            # since the cutoff, which on a tight window is most runs. INFO, not
+            # WARNING - the alarm below exists to catch systemic failure, and
+            # one that cries wolf every three hours stops being read.
+            logger.info(
+                "Watch '%s': %d candidate(s) considered, all posted before the "
+                "age cutoff (%s). Nothing new since then - widen or remove that "
+                "setting to see them.",
+                watch.name, considered, _age_cutoff_label(watch),
+            )
+        elif all_lost_to_one_stage and dominant_stage == "keyword_mismatch":
             # Report `considered`, NOT total_raw. The condition above is about
             # newly-considered listings, but this used to quote the raw search
             # total - which includes everything already skipped as seen. On
@@ -590,12 +712,40 @@ def _extract_posted_date(item: Optional[dict]) -> str:
 
 
 def _extract_condition(item: Optional[dict]) -> Optional[str]:
+    """The seller's stated condition, e.g. "used_good". None when absent.
+
+    Two things about the payload that the first version of this got wrong, both
+    confirmed against a live item-detail response on 2026-09-26:
+
+        "attributes": {"0": {"attribute_name": "Condition",
+                             "value": "used_good",
+                             "label": "Used - good"}}
+
+    - `attributes` is an object keyed by string index, NOT a JSON array - the
+      same shape quirk `SociaVaultClient.search()` already normalizes for
+      listings. Iterating it as a list yields the bare key `"0"`, and calling
+      `.get()` on a string raises AttributeError, so any watch that switched
+      `condition_filter` on would have crashed its whole run.
+    - The attribute's NAME is in `attribute_name`. `label` holds the human
+      rendering of its value ("Used - good"), so matching `label ==
+      "Condition"` never matched anything either way.
+
+    Still tolerates a plain list, since that's what the docs show and it costs
+    one isinstance to keep working if they ever ship it that way.
+    """
     if not item:
         return None
-    return next(
-        (a.get("value") for a in item.get("attributes", []) if a.get("label") == "Condition"),
-        None,
-    )
+    attributes = item.get("attributes") or {}
+    if isinstance(attributes, dict):
+        attributes = list(attributes.values())
+    for attribute in attributes:
+        if not isinstance(attribute, dict):
+            continue
+        if str(attribute.get("attribute_name", "")).strip().lower() == "condition":
+            # `value` is the machine-readable form and what condition_filter is
+            # written against; `label` is the fallback if it's ever missing.
+            return attribute.get("value") or attribute.get("label")
+    return None
 
 
 def run_all(config: AppConfig, only_watch: Optional[str] = None, dry_run: bool = False) -> int:

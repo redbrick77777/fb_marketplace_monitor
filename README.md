@@ -264,6 +264,44 @@ fetched once per listing and reused for both checks, not fetched twice.
 endpoint, not search. Leave it out of a watch to skip that check and save
 credits.
 
+### Age limit: `max_age_days` and `posted_after`
+
+Both optional, both default to no limit. Facebook happily returns months-old
+listings alongside fresh ones - a "macbook" search on 2026-09-26 came back with
+8 of 17 listings from May-July - and once they're in the sheet they look
+exactly like new finds.
+
+**`max_age_days`** (e.g. `30`) is a rolling window: keep listings posted within
+the last N days, counted back from the moment each run starts. This is usually
+the one you want, because it keeps working without being touched. It's elapsed
+time, not calendar days, and the window is fixed once per run so the boundary
+can't creep while a run is working through its candidates.
+
+**`posted_after`** (e.g. `2026-09-01`) is a fixed date instead. It's
+**inclusive and local**: `2026-09-01` keeps a listing posted at 22:00 on
+September 1st, even though that's already September 2nd in UTC. That's the same
+date shown in the `Posted At` column, so you can pick a cutoff straight off the
+sheet. Good for "everything since I reset this watch" - but it doesn't advance
+by itself, so a cutoff left untouched for months gradually stops filtering
+anything.
+
+Setting both is allowed; whichever cutoff is **later** applies, the same way
+every other filter here composes.
+
+Two things that make this filter unlike the others:
+
+- It's **free**. The posting time comes back on the search response itself, so
+  an out-of-window listing is rejected before any geocode or item-detail credit
+  is spent.
+- Listings dropped as too old are **not marked seen**. Every other rejection
+  here is a one-way door, but this one costs nothing to re-decide, so widening
+  the window later brings those listings back rather than losing them
+  permanently.
+
+A listing whose `creation_time` is missing is **kept**, not dropped - "we
+couldn't tell" isn't "it's old" - and a `WARNING` reports how many, so an
+upstream field change can't silently switch the filter off.
+
 **Radius re-check.** `radius_miles` is sent to SociaVault's search too, but
 Facebook doesn't strictly honor it - scrolling far enough surfaces listings
 well outside the requested radius, the same way it surfaces
@@ -290,9 +328,12 @@ Run with `--verbose` and check the log for two specific lines:
   just above it (DEBUG level) to see how sellers are actually wording them.
 
 Either way, a `DEBUG`-level summary line breaks down exactly how many
-listings were filtered out at each stage (already-seen, keyword mismatch,
-excluded, price, location, condition) so you're never guessing which filter
-did it.
+listings were filtered out at each stage (already-seen, too old, keyword
+mismatch, excluded, price, location, condition) so you're never guessing which
+filter did it.
+
+If that breakdown shows everything dying at `posted_before_cutoff`, that's not
+a fault - it just means nothing has been posted since your `posted_after` date.
 
 ## Adding more searches later
 
@@ -318,6 +359,19 @@ be rediscovered from scratch:
 - **`listings` (and `locations`, from location-search) come back as an
   object keyed by string index** (`"0"`, `"1"`, ...), not a JSON array.
   Both `search()` and `resolve_location()` normalize this to a real list.
+- **Item detail's `attributes` is index-keyed the same way**, and the
+  attribute's *name* is in `attribute_name` - `label` holds the human form of
+  its **value**: `{"0": {"attribute_name": "Condition", "value":
+  "used_good", "label": "Used - good"}}`. `_extract_condition()` read it as a
+  list and matched on `label == "Condition"`, which meant iterating the object
+  yielded the bare string `"0"` and `.get()` on it raised `AttributeError` -
+  so turning `condition_filter` on would have taken down the whole run. No
+  watch had it enabled, which is why it sat there unnoticed; fixed 2026-09-26.
+- **`creation_time` is on the search response, not just item detail** - present
+  on 17 of 17 listings in a live probe on 2026-09-26, matching item detail
+  exactly. That's what makes the age filter free. It was the other way round
+  when `_extract_posted_date()` was written, so don't assume a field's absence
+  from one endpoint is permanent; re-probe before designing around it.
 - **A failure can hide inside an HTTP 200** - `{"success": false, "error":
   "..."}` with a 200 status, not just via 4xx/5xx. `_get()` checks the
   `success` field explicitly and raises `SociaVaultError` if it's `False`,
