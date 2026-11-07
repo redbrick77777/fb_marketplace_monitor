@@ -355,7 +355,7 @@ def run_watch(
                 item_detail = _fetch_item(client, listing_id, state)
             return item_detail
 
-        title_matches = matches_any_keyword(title, watch.keywords)
+        title_matches = matches_any_keyword(title, watch.keywords, watch.keyword_any_order)
 
         # Cheapest rejection first: if the title doesn't match and this watch
         # never consults the description, nothing below can rescue this
@@ -395,7 +395,9 @@ def run_watch(
                 # couldn't look". Falling through would mark this listing seen
                 # as a keyword mismatch and never revisit it.
                 break
-            description_matches = matches_any_keyword(description, watch.keywords)
+            description_matches = matches_any_keyword(
+                description, watch.keywords, watch.keyword_any_order
+            )
 
         if not title_matches and not description_matches:
             keyword_mismatch_count += 1

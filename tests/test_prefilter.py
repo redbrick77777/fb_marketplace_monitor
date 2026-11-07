@@ -936,6 +936,87 @@ def test_message_building() -> None:
     check("a listing with no price/distance/posted still renders", "t" in missing)
 
 
+def test_keyword_any_order() -> None:
+    from fb_marketplace_monitor.matching import matches_any_keyword
+
+    def hit(text, keywords, any_order):
+        return matches_any_keyword(text, keywords, any_order=any_order)
+
+    print("\nkeyword_any_order matching:")
+    check("default rule: 'KTM 890' misses '890 KTM Adventure R' (the gap)",
+          not hit("890 KTM Adventure R", ["KTM 890"], False))
+    check("any_order: 'KTM 890' matches '890 KTM Adventure R'",
+          hit("890 KTM Adventure R", ["KTM 890"], True))
+    check("any_order: 'KTM 890' matches 'KTM Adventure 890'",
+          hit("KTM Adventure 890", ["KTM 890"], True))
+    check("any_order: 'Tiger 900' matches '900 Tiger Rally Pro'",
+          hit("2021 900 Tiger Rally Pro", ["Tiger 900"], True))
+    check("any_order: a glued word still counts ('890ADV KTM')",
+          hit("2023 890ADV KTM", ["KTM 890"], True))
+    check("any_order: 'KTM 890' does NOT match '8,900 miles' (whole words only)",
+          not hit("KTM 1290, 8,900 miles", ["KTM 890"], True))
+    check("any_order: a price like $12,890 is not the word '890'",
+          not hit("KTM 1290 asking $12,890", ["KTM 890"], True))
+    check("any_order: every keyword word must be present",
+          not hit("890 Duke", ["KTM 890 Adventure"], True))
+    check("any_order never loses an old match ('R1250 GS' vs 'R1250GS')",
+          hit("2019 BMW R1250GS", ["R1250 GS"], True))
+    check("any_order: 'R 1250 GS' spaced out still matches",
+          hit("BMW R 1250 GS Adventure", ["1250 GS"], True))
+    check("why it's opt-in: 'Cobia 220' would match '220 hp' on another boat",
+          hit("Cobia 256 with 220 hp Yamaha", ["Cobia 220"], True)
+          and not hit("Cobia 256 with 220 hp Yamaha", ["Cobia 220"], False))
+
+
+def test_keyword_any_order_end_to_end(workdir: Path) -> None:
+    """The setting reaches run_watch, and the default leaves behaviour as-is."""
+    listing = make_listing("in_range", "890 KTM Adventure R", "Neptune Beach", "Florida")
+    watch = replace(WATCH, keywords=["KTM 890"], check_description=False)
+
+    def run(w, db):
+        store = Store(str(workdir / db))
+        store.cache_location(w.city, *JAX)
+        return run_watch(StubClient([listing]), None, XlsxWriter(), store, w, dry_run=True)
+
+    print("\nkeyword_any_order end to end:")
+    check("default (off): reordered title is still rejected",
+          run(watch, "anyorder-off.db") == 0)
+    check("on: reordered title gets through",
+          run(replace(watch, keyword_any_order=True), "anyorder-on.db") == 1)
+
+
+def test_keyword_any_order_config(workdir: Path) -> None:
+    from fb_marketplace_monitor.config import load_config
+
+    def load(line: str):
+        config_file = workdir / "any-order.yaml"
+        config_file.write_text(
+            "sociavault_api_key: x\n"
+            "watches:\n"
+            "  - name: w\n"
+            "    keywords: [rolex]\n"
+            "    city: Jacksonville, FL\n"
+            "    output_type: xlsx\n"
+            "    output_file: unused.xlsx\n"
+            f"{line}"
+        )
+        return load_config(str(config_file)).watches[0]
+
+    def rejects(line: str) -> bool:
+        try:
+            load(line)
+            return False
+        except ValueError:
+            return True
+
+    print("\nkeyword_any_order config parsing:")
+    check("omitted means off", load("").keyword_any_order is False)
+    check("true turns it on", load("    keyword_any_order: true\n").keyword_any_order is True)
+    check("false keeps it off", load("    keyword_any_order: false\n").keyword_any_order is False)
+    check('a quoted "false" is refused, not read as true',
+          rejects('    keyword_any_order: "false"\n'))
+
+
 def main() -> int:
     logging.basicConfig(level=logging.CRITICAL)  # keep app logs out of the report
     workdir = Path(tempfile.mkdtemp(prefix="fbmm-tests-"))
@@ -960,6 +1041,9 @@ def main() -> int:
         test_out_of_credits_alerts_and_fails_the_run(workdir)
         test_message_building()
         test_envelope_bug_is_loud(workdir)
+        test_keyword_any_order()
+        test_keyword_any_order_end_to_end(workdir)
+        test_keyword_any_order_config(workdir)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

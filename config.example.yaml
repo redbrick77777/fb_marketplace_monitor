@@ -58,6 +58,13 @@ watches:
     check_description: false           # true = also check the listing description if the
                                         # title alone doesn't match (costs 1 extra SociaVault
                                         # credit per non-matching listing - see README)
+    keyword_any_order: false           # true = a keyword also matches when all its words
+                                        # appear in any order, as whole words ("KTM 890"
+                                        # matches "890 KTM Adventure R"). Only ever adds
+                                        # matches. Good for model names sellers reorder;
+                                        # bad for short ones - "Cobia 220" would hit
+                                        # "Cobia 256 with 220 hp". Keywords only, not
+                                        # exclude_keywords. Defaults to false.
     exclude_keywords:                  # skip listings whose title matches any of these
       - "rims only"
       - "wheel only"

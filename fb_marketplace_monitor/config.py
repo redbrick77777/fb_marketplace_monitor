@@ -27,6 +27,11 @@ class WatchConfig:
     output_file: Optional[str] = None  # required if output_type == "xlsx"
     search_terms: list[str] = field(default_factory=list)  # what's SENT to SociaVault's search
     check_description: bool = False  # fall back to checking description if title doesn't match
+    # Also accept a keyword whose words all appear in any order ("KTM 890"
+    # matches "890 KTM Adventure R"). Off by default: on short keywords it
+    # over-matches - "Cobia 220" would hit "Cobia 256 with 220 hp". Applies to
+    # `keywords` only, never to exclude_keywords. See matching.matches_any_keyword.
+    keyword_any_order: bool = False
     price_min: Optional[int] = None
     price_max: Optional[int] = None
     # Two ways to say "don't show me stale listings"; both optional, and a
@@ -158,6 +163,21 @@ def _parse_max_age_days(value, context: str) -> Optional[int]:
     return value
 
 
+def _parse_strict_bool(value, key: str, default: bool, context: str) -> bool:
+    """A yes/no setting that refuses anything but a real YAML boolean.
+
+    bool() would read a quoted "false" as True - the opposite of what was
+    written - so a typo'd value is refused rather than guessed at.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"Invalid {key} {value!r} in {context} - expected true or false (unquoted)."
+    )
+
+
 def _require(d: dict, key: str, context: str):
     if key not in d or d[key] in (None, ""):
         raise ValueError(f"Missing required config key '{key}' in {context}")
@@ -217,6 +237,9 @@ def load_config(path: str) -> AppConfig:
                 output_file=output_file,
                 search_terms=w.get("search_terms", []) or [],
                 check_description=bool(w.get("check_description", False)),
+                keyword_any_order=_parse_strict_bool(
+                    w.get("keyword_any_order"), "keyword_any_order", False, context
+                ),
                 price_min=w.get("price_min"),
                 price_max=w.get("price_max"),
                 posted_after=_parse_posted_after(w.get("posted_after"), context),
